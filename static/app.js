@@ -1,4 +1,5 @@
 const sessionStorageKey = "moonreach_session_id";
+const userStorageKey = "moonreach_user_id";
 const onboardingSection = document.getElementById("onboarding");
 const chatSection = document.getElementById("chat-container");
 const messageArea = document.getElementById("message-area");
@@ -10,8 +11,28 @@ const messageInput = document.getElementById("message-input");
 const sendButton = document.getElementById("send-message");
 const planButton = document.getElementById("generate-plan");
 const resetButton = document.getElementById("reset-session");
+const newSessionButton = document.getElementById("new-session-button");
+const sessionListElement = document.getElementById("session-list");
+const sessionContextElement = document.getElementById("session-context");
 
 let currentSessionId = localStorage.getItem(sessionStorageKey);
+let sessions = [];
+
+const getUserId = () => {
+  let userId = localStorage.getItem(userStorageKey);
+  if (!userId) {
+    userId = (window.crypto && typeof window.crypto.randomUUID === "function")
+      ? window.crypto.randomUUID()
+      : `user-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    localStorage.setItem(userStorageKey, userId);
+  }
+  return userId;
+};
+
+const getRequestHeaders = (extraHeaders = {}) => ({
+  ...extraHeaders,
+  "X-User-Id": getUserId(),
+});
 
 const showElement = (element) => element.classList.remove("hidden");
 const hideElement = (element) => element.classList.add("hidden");
@@ -34,11 +55,89 @@ const addMessageBubble = (role, content) => {
   messageArea.scrollTop = messageArea.scrollHeight;
 };
 
-const setSession = (sessionId) => {
+const clearChatState = () => {
+  messageArea.innerHTML = "";
+  clearChips();
+  planList.innerHTML = "";
+  hideElement(planSection);
+};
+
+const setActiveSession = (sessionId) => {
+  const buttons = sessionListElement.querySelectorAll(".session-item");
+  buttons.forEach((button) => {
+    const isActive = Number(button.dataset.sessionId) === Number(sessionId);
+    button.classList.toggle("active", isActive);
+  });
+};
+
+const renderSessionList = () => {
+  sessionListElement.innerHTML = "";
+  if (!sessions.length) {
+    const emptyState = document.createElement("p");
+    emptyState.className = "session-meta";
+    emptyState.textContent = "No saved sessions yet.";
+    sessionListElement.appendChild(emptyState);
+    return;
+  }
+
+  sessions.forEach((session) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "session-item";
+    button.dataset.sessionId = session.id;
+    button.innerHTML = `
+      <div class="session-title">${session.university || `Session ${session.id}`}</div>
+      <div class="session-meta">${[session.major, session.year].filter(Boolean).join(" • ")}</div>
+    `;
+    button.addEventListener("click", () => {
+      setSession(session.id);
+    });
+    sessionListElement.appendChild(button);
+  });
+  setActiveSession(currentSessionId);
+};
+
+const renderSessionContext = (session) => {
+  if (!session) {
+    sessionContextElement.innerHTML = "";
+    sessionContextElement.classList.add("hidden");
+    return;
+  }
+
+  sessionContextElement.classList.remove("hidden");
+  sessionContextElement.innerHTML = `
+    <h2>Student profile</h2>
+    <div class="profile-grid">
+      <div class="profile-row">
+        <span class="profile-label">University</span>
+        <span class="profile-value">${session.university || "—"}</span>
+      </div>
+      <div class="profile-row">
+        <span class="profile-label">Major</span>
+        <span class="profile-value">${session.major || "—"}</span>
+      </div>
+      <div class="profile-row">
+        <span class="profile-label">Year / Level</span>
+        <span class="profile-value">${session.year || "—"}</span>
+      </div>
+      <div class="profile-row">
+        <span class="profile-label">Career Goal</span>
+        <span class="profile-value">${session.goals || "—"}</span>
+      </div>
+    </div>
+    <p class="profile-note">This is the context the AI remembers and uses to personalize your coaching.</p>
+  `;
+};
+
+const setSession = (sessionId, { skipHistory = false } = {}) => {
   currentSessionId = sessionId;
   localStorage.setItem(sessionStorageKey, String(sessionId));
   sessionIdElement.textContent = String(sessionId);
+  setActiveSession(sessionId);
   showChat();
+  if (!skipHistory) {
+    loadHistory();
+  }
 };
 
 const clearChips = () => {
@@ -74,7 +173,6 @@ const normalizePlan = (plan) => {
         return parsed.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim());
       }
     } catch (err) {
-      // Fall back to newline splitting.
       return plan.split(/\n+/).map((item) => item.trim()).filter(Boolean);
     }
   }
@@ -103,6 +201,20 @@ const handleError = async (response) => {
   addMessageBubble("assistant", `Error: ${response.status} ${text}`);
 };
 
+const loadSessions = async () => {
+  try {
+    const response = await fetch("/sessions", { headers: getRequestHeaders() });
+    if (!response.ok) {
+      return;
+    }
+    const payload = await response.json();
+    sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+    renderSessionList();
+  } catch (error) {
+    console.error(error);
+  }
+};
+
 const sendMessage = async () => {
   const text = messageInput.value.trim();
   if (!text || !currentSessionId) {
@@ -114,7 +226,7 @@ const sendMessage = async () => {
   try {
     const response = await fetch("/chat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: getRequestHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ session_id: Number(currentSessionId), message: text }),
     });
     if (!response.ok) {
@@ -130,20 +242,22 @@ const sendMessage = async () => {
 };
 
 const loadHistory = async () => {
+  clearChatState();
   if (!currentSessionId) {
     showOnboarding();
     return;
   }
   try {
-    const response = await fetch(`/session/${currentSessionId}/history`);
+    const response = await fetch(`/session/${currentSessionId}/history`, { headers: getRequestHeaders() });
     if (!response.ok) {
       localStorage.removeItem(sessionStorageKey);
       currentSessionId = null;
+      setActiveSession(null);
       return showOnboarding();
     }
     const payload = await response.json();
     sessionIdElement.textContent = String(currentSessionId);
-    messageArea.innerHTML = "";
+    renderSessionContext(payload.session);
     payload.messages.forEach((message) => {
       addMessageBubble(message.role, message.content);
     });
@@ -169,14 +283,18 @@ const createSession = async (event) => {
   try {
     const response = await fetch("/session", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: getRequestHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ university, major, year, goals }),
     });
     if (!response.ok) {
       return handleError(response);
     }
     const data = await response.json();
-    setSession(data.session_id);
+    const createdSession = { id: data.session_id, university, major, year, goals };
+    sessions = [createdSession, ...sessions.filter((session) => Number(session.id) !== Number(data.session_id))];
+    renderSessionList();
+    setSession(data.session_id, { skipHistory: true });
+    await loadHistory();
     addMessageBubble("assistant", "Session started. Ask me anything about career opportunities, internships, or next steps.");
   } catch (error) {
     addMessageBubble("assistant", "Unable to create a session. Please try again.");
@@ -191,7 +309,7 @@ const generatePlan = async () => {
   try {
     const response = await fetch("/plan", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: getRequestHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ session_id: Number(currentSessionId) }),
     });
     if (!response.ok) {
@@ -208,10 +326,10 @@ const generatePlan = async () => {
 const resetSession = () => {
   localStorage.removeItem(sessionStorageKey);
   currentSessionId = null;
-  messageArea.innerHTML = "";
-  clearChips();
-  planList.innerHTML = "";
-  hideElement(planSection);
+  clearChatState();
+  sessionIdElement.textContent = "";
+  renderSessionContext(null);
+  setActiveSession(null);
   showOnboarding();
 };
 
@@ -219,6 +337,7 @@ document.getElementById("onboarding-form").addEventListener("submit", createSess
 sendButton.addEventListener("click", sendMessage);
 planButton.addEventListener("click", generatePlan);
 resetButton.addEventListener("click", resetSession);
+newSessionButton.addEventListener("click", resetSession);
 messageInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
@@ -226,7 +345,9 @@ messageInput.addEventListener("keydown", (event) => {
   }
 });
 
+loadSessions();
 if (currentSessionId) {
+  setSession(currentSessionId, { skipHistory: true });
   loadHistory();
 } else {
   showOnboarding();
