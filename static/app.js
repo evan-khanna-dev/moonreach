@@ -63,6 +63,41 @@ const showSuggestedChips = (chips) => {
   });
 };
 
+const normalizePlan = (plan) => {
+  if (Array.isArray(plan)) {
+    return plan.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim());
+  }
+  if (typeof plan === "string") {
+    try {
+      const parsed = JSON.parse(plan);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim());
+      }
+    } catch (err) {
+      // Fall back to newline splitting.
+      return plan.split(/\n+/).map((item) => item.trim()).filter(Boolean);
+    }
+  }
+  return [];
+};
+
+const renderPlan = (plan) => {
+  const normalizedPlan = normalizePlan(plan);
+  if (!normalizedPlan.length) {
+    planList.innerHTML = "";
+    hideElement(planSection);
+    return;
+  }
+
+  planList.innerHTML = "";
+  normalizedPlan.forEach((item) => {
+    const li = document.createElement("li");
+    li.textContent = item;
+    planList.appendChild(li);
+  });
+  showElement(planSection);
+};
+
 const handleError = async (response) => {
   const text = await response.text();
   addMessageBubble("assistant", `Error: ${response.status} ${text}`);
@@ -112,6 +147,7 @@ const loadHistory = async () => {
     payload.messages.forEach((message) => {
       addMessageBubble(message.role, message.content);
     });
+    renderPlan(payload.plan);
     showChat();
   } catch (error) {
     console.error(error);
@@ -162,13 +198,7 @@ const generatePlan = async () => {
       return handleError(response);
     }
     const data = await response.json();
-    planList.innerHTML = "";
-    data.plan.forEach((item) => {
-      const li = document.createElement("li");
-      li.textContent = item;
-      planList.appendChild(li);
-    });
-    showElement(planSection);
+    renderPlan(data.plan);
   } catch (error) {
     addMessageBubble("assistant", "Unable to generate a plan. Please try again.");
     console.error(error);

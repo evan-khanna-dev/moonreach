@@ -298,6 +298,33 @@ def get_message_history(session_id: int) -> List[Dict[str, str]]:
     return response.data or []
 
 
+def normalize_plan_items(raw_plan: Any) -> List[str]:
+    if isinstance(raw_plan, list):
+        return [str(item).strip() for item in raw_plan if str(item).strip()]
+    if isinstance(raw_plan, str):
+        try:
+            parsed = json.loads(raw_plan)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except Exception:
+            pass
+        return [item.strip() for item in re.split(r"\n+", raw_plan) if item.strip()]
+    return []
+
+
+def get_latest_plan(session_id: int) -> List[str]:
+    response = execute_db(
+        db_table("plans")
+        .select("plan_items")
+        .eq("session_id", session_id)
+        .order("created_at", desc=True)
+        .limit(1)
+    )
+    if not getattr(response, "data", None):
+        return []
+    return normalize_plan_items(response.data[0].get("plan_items"))
+
+
 @app.post("/session")
 async def create_session(session: SessionCreate) -> Dict[str, int]:
     response = execute_db(
@@ -398,6 +425,16 @@ async def generate_plan(request: PlanRequest) -> Dict[str, Any]:
     if not isinstance(plan_json, list) or not plan_json:
         plan_json = [item.strip() for item in re.split(r"\n+", raw_output) if item.strip()][:6]
 
+    plan_json = normalize_plan_items(plan_json)
+
+    save_response = execute_db(
+        db_table("plans").insert(
+            {"session_id": request.session_id, "plan_items": plan_json}
+        )
+    )
+    if not getattr(save_response, "data", None):
+        raise HTTPException(status_code=500, detail="Failed to save generated plan")
+
     return {"plan": plan_json}
 
 
@@ -405,7 +442,8 @@ async def generate_plan(request: PlanRequest) -> Dict[str, Any]:
 async def session_history(session_id: int) -> Dict[str, Any]:
     session = get_session(session_id)
     messages = get_message_history(session_id)
-    return {"session": session, "messages": messages}
+    plan = get_latest_plan(session_id)
+    return {"session": session, "messages": messages, "plan": plan}
 
 
 @app.get("/")
