@@ -1,0 +1,154 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Inter, system-ui, sans-serif;
+  background: #f4f7fb;
+  color: #1c2237;
+}
+
+main {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.hero {
+  padding: 18px 24px;
+  margin-bottom: 18px;
+  background: #33475b;
+  color: #fff;
+  border-radius: 18px;
+}
+
+.card {
+  background: #ffffff;
+  border-radius: 18px;
+  padding: 20px;
+  margin-bottom: 18px;
+  box-shadow: 0 12px 30px rgba(19, 26, 41, 0.08);
+}
+
+label {
+  display: block;
+  margin-bottom: 14px;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid #d8e2ef;
+  border-radius: 12px;
+  padding: 12px 14px;
+  font: inherit;
+}
+
+textarea {
+  min-height: 100px;
+  resize: vertical;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  padding: 12px 20px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button[type="submit"],
+#send-message,
+#generate-plan {
+  background: #2e64ff;
+  color: white;
+}
+
+button:hover {
+  opacity: 0.95;
+}
+
+.hidden {
+  display: none;
+}
+
+.chat-card {
+  min-height: 320px;
+  max-height: 580px;
+  overflow-y: auto;
+  display: grid;
+  gap: 12px;
+}
+
+.message {
+  padding: 16px;
+  border-radius: 18px;
+  line-height: 1.6;
+  max-width: 88%;
+}
+
+.message.user {
+  background: #e8efff;
+  justify-self: end;
+}
+
+.message.assistant {
+  background: #f4f6ff;
+}
+
+.message .meta {
+  font-size: 0.85rem;
+  opacity: 0.75;
+  margin-bottom: 8px;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.chip {
+  border: 1px solid #d8e2ef;
+  background: #f7f9ff;
+  padding: 10px 16px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.chip:hover {
+  background: #edf2ff;
+}
+
+.composer {
+  display: grid;
+  gap: 14px;
+}
+
+.composer-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.session-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
+.note {
+  font-size: 0.95rem;
+  color: #425168;
+}
+
+@media (max-width: 640px) {
+  .session-info {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
