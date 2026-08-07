@@ -1,12 +1,13 @@
 const sessionStorageKey = "moonreach_session_id";
 const userStorageKey = "moonreach_user_id";
 const onboardingSection = document.getElementById("onboarding");
-const chatSection = document.getElementById("chat-container");
+const workspaceSection = document.getElementById("workspace-container");
 const messageArea = document.getElementById("message-area");
 const chipsContainer = document.getElementById("chips");
 const sessionIdElement = document.getElementById("session-id");
 const planSection = document.getElementById("plan-output");
 const planList = document.getElementById("plan-list");
+const radarListElement = document.getElementById("radar-list");
 const messageInput = document.getElementById("message-input");
 const sendButton = document.getElementById("send-message");
 const planButton = document.getElementById("generate-plan");
@@ -38,13 +39,13 @@ const showElement = (element) => element.classList.remove("hidden");
 const hideElement = (element) => element.classList.add("hidden");
 
 const showOnboarding = () => {
-  hideElement(chatSection);
+  hideElement(workspaceSection);
   showElement(onboardingSection);
 };
 
-const showChat = () => {
+const showWorkspace = () => {
   hideElement(onboardingSection);
-  showElement(chatSection);
+  showElement(workspaceSection);
 };
 
 const addMessageBubble = (role, content) => {
@@ -60,6 +61,7 @@ const clearChatState = () => {
   clearChips();
   planList.innerHTML = "";
   hideElement(planSection);
+  radarListElement.innerHTML = "";
 };
 
 const setActiveSession = (sessionId) => {
@@ -134,7 +136,7 @@ const setSession = (sessionId, { skipHistory = false } = {}) => {
   localStorage.setItem(sessionStorageKey, String(sessionId));
   sessionIdElement.textContent = String(sessionId);
   setActiveSession(sessionId);
-  showChat();
+  showWorkspace();
   if (!skipHistory) {
     loadHistory();
   }
@@ -196,6 +198,39 @@ const renderPlan = (plan) => {
   showElement(planSection);
 };
 
+const renderRadar = (opportunities) => {
+  radarListElement.innerHTML = "";
+  const items = Array.isArray(opportunities) ? opportunities : [];
+  if (!items.length) {
+    const emptyState = document.createElement("div");
+    emptyState.className = "radar-empty";
+    emptyState.textContent = "Your Career Radar is still empty. Start a conversation to add opportunities.";
+    radarListElement.appendChild(emptyState);
+    return;
+  }
+
+  items.forEach((item) => {
+    const card = document.createElement("article");
+    card.className = "radar-card";
+    card.innerHTML = `
+      <div class="radar-card-header">
+        <div>
+          <h3>${item.title || "Untitled opportunity"}</h3>
+          <p class="pill">${item.category || "Other"}</p>
+        </div>
+        <span class="priority-pill">P${item.priority_score || 5}</span>
+      </div>
+      <p class="radar-description">${item.description || ""}</p>
+      <p class="radar-reason">${item.reason_relevant || ""}</p>
+      <div class="radar-meta">
+        <span>Status: ${item.status || "suggested"}</span>
+        ${item.source_url ? `<a href="${item.source_url}" target="_blank" rel="noreferrer">Open source</a>` : ""}
+      </div>
+    `;
+    radarListElement.appendChild(card);
+  });
+};
+
 const handleError = async (response) => {
   const text = await response.text();
   addMessageBubble("assistant", `Error: ${response.status} ${text}`);
@@ -234,9 +269,26 @@ const sendMessage = async () => {
     }
     const data = await response.json();
     addMessageBubble("assistant", data.assistant_response);
+    await loadCareerRadar();
     showSuggestedChips(data.suggested_replies || []);
   } catch (error) {
     addMessageBubble("assistant", "Unable to reach the server. Please try again.");
+    console.error(error);
+  }
+};
+
+const loadCareerRadar = async () => {
+  if (!currentSessionId) {
+    return;
+  }
+  try {
+    const response = await fetch(`/career-radar/${currentSessionId}`, { headers: getRequestHeaders() });
+    if (!response.ok) {
+      return;
+    }
+    const payload = await response.json();
+    renderRadar(payload.opportunities || []);
+  } catch (error) {
     console.error(error);
   }
 };
@@ -262,7 +314,8 @@ const loadHistory = async () => {
       addMessageBubble(message.role, message.content);
     });
     renderPlan(payload.plan);
-    showChat();
+    await loadCareerRadar();
+    showWorkspace();
   } catch (error) {
     console.error(error);
     showOnboarding();

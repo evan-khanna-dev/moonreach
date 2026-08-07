@@ -19,13 +19,13 @@
     <div class="content-stack">
       <section class="hero">
         <div>
-          <h1>MoonReach</h1>
-          <p>Your student career coach for university-specific opportunities and practical next steps.</p>
+          <h1>MoonReach Workspace</h1>
+          <p>Your persistent student career operating system for opportunities, planning, and coaching.</p>
         </div>
       </section>
 
       <section id="onboarding" class="card">
-        <h2>Start your session</h2>
+        <h2>Start your workspace</h2>
         <form id="onboarding-form">
           <label>
             University
@@ -43,38 +43,62 @@
             Career goals
             <textarea id="goals" placeholder="Describe your goals, e.g. internships, networking, job search" required></textarea>
           </label>
-          <button type="submit">Create session</button>
+          <button type="submit">Create workspace</button>
         </form>
       </section>
 
-      <section id="chat-container" class="hidden">
+      <section id="workspace-container" class="hidden">
         <div class="session-info card">
-          <p><strong>Session ID:</strong> <span id="session-id"></span></p>
-          <button id="reset-session" type="button">New session</button>
+          <div>
+            <p class="section-label">Active workspace</p>
+            <h2 id="session-id">—</h2>
+          </div>
+          <button id="reset-session" type="button">New workspace</button>
         </div>
 
         <div id="session-context" class="card session-context hidden"></div>
 
-        <div id="message-area" class="chat-card"></div>
+        <div class="workspace-grid">
+          <section class="card radar-panel">
+            <div class="panel-header">
+              <div>
+                <p class="section-label">Career Radar</p>
+                <h2>Persistent opportunities</h2>
+              </div>
+            </div>
+            <div id="radar-list" class="radar-list"></div>
+          </section>
 
-        <div id="chips" class="chips"></div>
-
-        <div class="composer card">
-          <textarea id="message-input" placeholder="Ask about opportunities, internships, or next career steps..."></textarea>
-          <div class="composer-actions">
-            <button id="send-message" type="button">Send</button>
-            <button id="generate-plan" type="button">Generate plan</button>
-          </div>
+          <section class="card plan-panel">
+            <div class="panel-header">
+              <div>
+                <p class="section-label">Career Plan</p>
+                <h2>Action items</h2>
+              </div>
+              <button id="generate-plan" type="button">Generate plan</button>
+            </div>
+            <div id="plan-output" class="plan-output hidden">
+              <ol id="plan-list"></ol>
+            </div>
+          </section>
         </div>
 
-        <section id="plan-output" class="card hidden">
-          <h2>Action Plan</h2>
-          <ol id="plan-list"></ol>
+        <section class="card chat-panel">
+          <div class="panel-header">
+            <div>
+              <p class="section-label">Coach</p>
+              <h2>Conversation and discovery</h2>
+            </div>
+          </div>
+          <div id="message-area" class="chat-card"></div>
+          <div id="chips" class="chips"></div>
+          <div class="composer">
+            <textarea id="message-input" placeholder="Ask about opportunities, internships, or next career steps..."></textarea>
+            <div class="composer-actions">
+              <button id="send-message" type="button">Send</button>
+            </div>
+          </div>
         </section>
-      </section>
-
-      <section class="note card">
-        <p>Ask about internships, career center resources, employer connections, clubs, or local opportunities to surface university-specific guidance.</p>
       </section>
     </div>
   </main>

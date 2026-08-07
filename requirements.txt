@@ -1,6 +1,6 @@
-fastapi==0.141.1
-uvicorn==0.22.0
+fastapi==0.128.1
+uvicorn==0.39.0
 anthropic==0.120.2
 supabase==2.31.0
 httpx==0.28.1
-python-dotenv==1.2.2
+python-dotenv==1.2.1

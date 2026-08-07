@@ -2,6 +2,7 @@ import json
 import os
 import re
 import html
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
@@ -124,6 +125,172 @@ class PlanRequest(BaseModel):
     session_id: int
 
 
+class OpportunityCreate(BaseModel):
+    session_id: int
+    title: str
+    category: str
+    description: str
+    reason_relevant: str
+    source_url: Optional[str] = None
+    priority_score: Optional[int] = None
+    status: Optional[str] = "suggested"
+
+
+class OpportunityUpdate(BaseModel):
+    title: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    reason_relevant: Optional[str] = None
+    source_url: Optional[str] = None
+    priority_score: Optional[int] = None
+    status: Optional[str] = None
+
+
+VALID_OPPORTUNITY_CATEGORIES = {
+    "Internship",
+    "Research",
+    "Event",
+    "Networking",
+    "Organization",
+    "Hackathon",
+    "Competition",
+    "Scholarship",
+    "Leadership",
+    "Career Center",
+    "Employer Program",
+    "Conference",
+    "Other",
+}
+
+VALID_OPPORTUNITY_STATUSES = {"suggested", "interested", "exploring", "applied", "completed", "archived"}
+
+
+def normalize_category(value: Optional[str]) -> str:
+    if not isinstance(value, str):
+        return "Other"
+    cleaned = value.strip()
+    if not cleaned:
+        return "Other"
+    if cleaned in VALID_OPPORTUNITY_CATEGORIES:
+        return cleaned
+    return "Other"
+
+
+def normalize_status(value: Optional[str]) -> str:
+    if not isinstance(value, str):
+        return "suggested"
+    cleaned = value.strip().lower()
+    if cleaned in VALID_OPPORTUNITY_STATUSES:
+        return cleaned
+    return "suggested"
+
+
+def normalize_priority_score(value: Any) -> int:
+    if isinstance(value, bool):
+        return 5
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        return 5
+    return max(1, min(10, numeric))
+
+
+class OpportunityService:
+    def __init__(self) -> None:
+        self.table = db_table("opportunities")
+
+    def _now(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _sanitize_payload(self, payload: Dict[str, Any], partial: bool = False) -> Dict[str, Any]:
+        sanitized: Dict[str, Any] = {}
+        if not partial or "title" in payload:
+            sanitized["title"] = str(payload.get("title") or "").strip()
+        if not partial or "category" in payload:
+            sanitized["category"] = normalize_category(payload.get("category"))
+        if not partial or "description" in payload:
+            sanitized["description"] = str(payload.get("description") or "").strip()
+        if not partial or "reason_relevant" in payload:
+            sanitized["reason_relevant"] = str(payload.get("reason_relevant") or "").strip()
+        if not partial or "source_url" in payload:
+            sanitized["source_url"] = str(payload.get("source_url") or "").strip() if payload.get("source_url") else None
+        if not partial or "priority_score" in payload:
+            sanitized["priority_score"] = normalize_priority_score(payload.get("priority_score"))
+        if not partial or "status" in payload:
+            sanitized["status"] = normalize_status(payload.get("status"))
+        return sanitized
+
+    def create_opportunity(self, session_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized = self._sanitize_payload(payload)
+        if not sanitized["title"]:
+            raise HTTPException(status_code=400, detail="Opportunity title is required")
+        if not sanitized["description"]:
+            raise HTTPException(status_code=400, detail="Opportunity description is required")
+
+        insert_payload = {
+            "session_id": session_id,
+            **sanitized,
+            "created_at": self._now(),
+            "updated_at": self._now(),
+        }
+        response = execute_db(self.table.insert(insert_payload).select("*"))
+        if not getattr(response, "data", None):
+            raise HTTPException(status_code=500, detail="Failed to create opportunity")
+        return response.data[0]
+
+    def update_opportunity(self, opportunity_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized = self._sanitize_payload(payload, partial=True)
+        if not sanitized:
+            raise HTTPException(status_code=400, detail="No update fields provided")
+        update_payload = {**sanitized, "updated_at": self._now()}
+        response = execute_db(self.table.update(update_payload).eq("id", opportunity_id).select("*"))
+        if not getattr(response, "data", None):
+            raise HTTPException(status_code=404, detail="Opportunity not found")
+        return response.data[0]
+
+    def archive_opportunity(self, opportunity_id: int) -> Dict[str, Any]:
+        response = execute_db(
+            self.table.update({"status": "archived", "updated_at": self._now()}).eq("id", opportunity_id).select("*")
+        )
+        if not getattr(response, "data", None):
+            raise HTTPException(status_code=404, detail="Opportunity not found")
+        return response.data[0]
+
+    def get_session_opportunities(self, session_id: int) -> List[Dict[str, Any]]:
+        response = execute_db(
+            self.table.select("*").eq("session_id", session_id).order("priority_score", desc=True).order("updated_at", desc=True)
+        )
+        return getattr(response, "data", None) or []
+
+    def find_duplicate_opportunity(self, session_id: int, candidate: Dict[str, Any], existing_opportunities: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+        opportunities = existing_opportunities if existing_opportunities is not None else self.get_session_opportunities(session_id)
+        normalized_title = self._normalize_text(candidate.get("title") or "")
+        candidate_source = str(candidate.get("source_url") or "").strip().lower()
+        if not normalized_title and not candidate_source:
+            return None
+        for opportunity in opportunities:
+            if not isinstance(opportunity, dict):
+                continue
+            if str(opportunity.get("status") or "").lower() == "archived":
+                continue
+            existing_title = self._normalize_text(opportunity.get("title") or "")
+            existing_source = str(opportunity.get("source_url") or "").strip().lower()
+            if existing_title and normalized_title and existing_title == normalized_title:
+                return opportunity
+            if candidate_source and existing_source and candidate_source == existing_source:
+                return opportunity
+        return None
+
+    def update_priority(self, opportunity_id: int, priority_score: int) -> Dict[str, Any]:
+        return self.update_opportunity(opportunity_id, {"priority_score": priority_score})
+
+    def update_status(self, opportunity_id: int, status: str) -> Dict[str, Any]:
+        return self.update_opportunity(opportunity_id, {"status": status})
+
+    def _normalize_text(self, value: str) -> str:
+        return re.sub(r"\W+", " ", str(value).strip().lower()).strip()
+
+
 def clean_text(raw: str) -> str:
     text = re.sub(r"<script.*?</script>", "", raw, flags=re.S | re.I)
     text = re.sub(r"<style.*?</style>", "", text, flags=re.S | re.I)
@@ -187,7 +354,11 @@ def parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
 
 
 def compose_coach_prompt(
-    context: Dict[str, str], history: List[Dict[str, str]], user_message: str, search_summary: Optional[str]
+    context: Dict[str, str],
+    history: List[Dict[str, str]],
+    user_message: str,
+    search_summary: Optional[str],
+    opportunities: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     conversation_lines = []
     for item in history:
@@ -203,6 +374,15 @@ def compose_coach_prompt(
             "Incorporate these results where they are relevant and avoid inventing new details."
         )
 
+    opportunity_block = ""
+    if opportunities:
+        opportunity_lines = ["Existing Career Radar items:"]
+        for item in opportunities[:8]:
+            opportunity_lines.append(
+                f"- {item.get('title', 'Untitled')} | category={item.get('category', 'Other')} | status={item.get('status', 'suggested')} | priority={item.get('priority_score', 5)} | reason={item.get('reason_relevant', '')}"
+            )
+        opportunity_block = "\n".join(opportunity_lines) + "\n\n"
+
     prompt = (
         f"{HUMAN_PROMPT}You are an empathetic AI career coach for college students. "
         "Maintain a conversational, flexible tone while keeping guidance focused on career opportunities, networking, employer connections, internships, and practical next steps. "
@@ -214,13 +394,19 @@ def compose_coach_prompt(
         f"Major: {context['major']}\n"
         f"Year: {context['year']}\n"
         f"Goals: {context['goals']}\n\n"
+        f"{opportunity_block}"
         "Recent conversation history:\n"
         f"{conversation_text}\n\n"
         f"User: {user_message}\n\n"
         f"{search_block}"
-        "Respond only with a valid JSON object containing the keys\n"
+        "Your two jobs are:\n"
+        "1. Answer the student's question naturally.\n"
+        "2. Decide whether the Career Radar should be updated with new opportunities, priority changes, status changes, or archived items.\n"
+        "Return only a valid JSON object with the keys\n"
         "- assistant_response: the coaching reply\n"
         "- suggested_replies: a short list of 3 next-user prompts relevant to the conversation\n"
+        "- career_radar_updates: an array of objects with action, title, category, description, reason_relevant, priority_score, status, source_url\n"
+        "If nothing should change, use an empty array.\n"
         "Do not add any additional text outside the JSON object."
         f"{AI_PROMPT}"
     )
@@ -461,6 +647,8 @@ async def chat(payload: ChatRequest, request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to save user message")
 
     history = get_message_history(payload.session_id, user_id=user_id, require_ownership=True)
+    opportunity_service = OpportunityService()
+    existing_opportunities = opportunity_service.get_session_opportunities(payload.session_id)
     search_summary = None
     search_triggered = should_run_search(user_text)
     if search_triggered:
@@ -469,7 +657,7 @@ async def chat(payload: ChatRequest, request: Request) -> Dict[str, Any]:
         if results:
             search_summary = format_search_summary(query, results)
 
-    prompt = compose_coach_prompt(session, history, user_text, search_summary)
+    prompt = compose_coach_prompt(session, history, user_text, search_summary, opportunities=existing_opportunities)
     raw_output = call_claude(prompt)
     parsed = parse_json_response(raw_output)
     if parsed is None or "assistant_response" not in parsed:
@@ -480,6 +668,7 @@ async def chat(payload: ChatRequest, request: Request) -> Dict[str, Any]:
                 "How can I approach employers in my field?",
                 "What should I do next to build my career readiness?",
             ],
+            "career_radar_updates": [],
         }
     else:
         suggested = parsed.get("suggested_replies")
@@ -489,6 +678,8 @@ async def chat(payload: ChatRequest, request: Request) -> Dict[str, Any]:
                 "How can I approach employers in my field?",
                 "What should I do next to build my career readiness?",
             ]
+        if not isinstance(parsed.get("career_radar_updates"), list):
+            parsed["career_radar_updates"] = []
 
     assistant_text = str(parsed["assistant_response"]).strip()
     save_response = execute_db(
@@ -499,10 +690,68 @@ async def chat(payload: ChatRequest, request: Request) -> Dict[str, Any]:
     if not getattr(save_response, "data", None):
         raise HTTPException(status_code=500, detail="Failed to save assistant response")
 
+    applied_updates = []
+    for update in parsed.get("career_radar_updates", []):
+        action = str(update.get("action") or "").strip().lower()
+        if action not in {"add", "update", "archive", "reprioritize"}:
+            continue
+        if action == "add":
+            existing = opportunity_service.find_duplicate_opportunity(payload.session_id, update, existing_opportunities)
+            if existing:
+                updated = opportunity_service.update_opportunity(int(existing["id"]), {
+                    "title": update.get("title") or existing.get("title"),
+                    "category": update.get("category") or existing.get("category"),
+                    "description": update.get("description") or existing.get("description"),
+                    "reason_relevant": update.get("reason_relevant") or existing.get("reason_relevant"),
+                    "source_url": update.get("source_url") or existing.get("source_url"),
+                    "priority_score": update.get("priority_score") or existing.get("priority_score"),
+                    "status": update.get("status") or existing.get("status") or "suggested",
+                })
+                applied_updates.append({"action": "update", "opportunity": updated})
+                continue
+            created = opportunity_service.create_opportunity(payload.session_id, {
+                "title": update.get("title") or "Untitled opportunity",
+                "category": update.get("category"),
+                "description": update.get("description") or "",
+                "reason_relevant": update.get("reason_relevant") or "",
+                "source_url": update.get("source_url"),
+                "priority_score": update.get("priority_score"),
+                "status": update.get("status") or "suggested",
+            })
+            applied_updates.append({"action": "add", "opportunity": created})
+        elif action == "update":
+            opportunity_id = update.get("opportunity_id")
+            if opportunity_id is None:
+                continue
+            updated = opportunity_service.update_opportunity(int(opportunity_id), {
+                "title": update.get("title"),
+                "category": update.get("category"),
+                "description": update.get("description"),
+                "reason_relevant": update.get("reason_relevant"),
+                "source_url": update.get("source_url"),
+                "priority_score": update.get("priority_score"),
+                "status": update.get("status"),
+            })
+            applied_updates.append({"action": "update", "opportunity": updated})
+        elif action == "archive":
+            opportunity_id = update.get("opportunity_id")
+            if opportunity_id is None:
+                continue
+            archived = opportunity_service.archive_opportunity(int(opportunity_id))
+            applied_updates.append({"action": "archive", "opportunity": archived})
+        elif action == "reprioritize":
+            opportunity_id = update.get("opportunity_id")
+            priority_score = update.get("priority_score")
+            if opportunity_id is None or priority_score is None:
+                continue
+            updated = opportunity_service.update_priority(int(opportunity_id), int(priority_score))
+            applied_updates.append({"action": "reprioritize", "opportunity": updated})
+
     return {
         "assistant_response": assistant_text,
         "suggested_replies": parsed["suggested_replies"],
         "search_used": bool(search_summary),
+        "career_radar_updates": applied_updates,
     }
 
 
@@ -537,6 +786,47 @@ async def generate_plan(payload: PlanRequest, request: Request) -> Dict[str, Any
         raise HTTPException(status_code=500, detail="Failed to save generated plan")
 
     return {"plan": plan_json}
+
+
+@app.post("/opportunities")
+async def create_opportunity(payload: OpportunityCreate, request: Request) -> Dict[str, Any]:
+    user_id = get_current_user_id(request)
+    get_session(payload.session_id, user_id=user_id, require_ownership=True)
+    service = OpportunityService()
+    created = service.create_opportunity(payload.session_id, payload.dict())
+    return {"opportunity": created}
+
+
+@app.get("/opportunities/{session_id}")
+async def list_opportunities(session_id: int, request: Request) -> Dict[str, Any]:
+    user_id = get_current_user_id(request)
+    get_session(session_id, user_id=user_id, require_ownership=True)
+    service = OpportunityService()
+    return {"opportunities": service.get_session_opportunities(session_id)}
+
+
+@app.patch("/opportunities/{opportunity_id}")
+async def update_opportunity(opportunity_id: int, payload: OpportunityUpdate, request: Request) -> Dict[str, Any]:
+    user_id = get_current_user_id(request)
+    service = OpportunityService()
+    updated = service.update_opportunity(opportunity_id, payload.dict(exclude_none=True))
+    return {"opportunity": updated}
+
+
+@app.delete("/opportunities/{opportunity_id}")
+async def delete_opportunity(opportunity_id: int, request: Request) -> Dict[str, Any]:
+    user_id = get_current_user_id(request)
+    service = OpportunityService()
+    archived = service.archive_opportunity(opportunity_id)
+    return {"opportunity": archived}
+
+
+@app.get("/career-radar/{session_id}")
+async def career_radar(session_id: int, request: Request) -> Dict[str, Any]:
+    user_id = get_current_user_id(request)
+    get_session(session_id, user_id=user_id, require_ownership=True)
+    service = OpportunityService()
+    return {"opportunities": service.get_session_opportunities(session_id)}
 
 
 @app.get("/session/{session_id}/history")

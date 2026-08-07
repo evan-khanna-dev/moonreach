@@ -1,6 +1,6 @@
-# MoonReach Student Career Coach
+# MoonReach Student Career Workspace
 
-A hackathon MVP for a student career coaching chatbot with one-time onboarding context, suggested reply chips, university-specific opportunity search, and a plan generator.
+MoonReach now behaves like a persistent student career operating system. Students onboard once, then use a durable Career Radar to track opportunities, priorities, and statuses over time while chat remains a tool for discovery and coaching.
 
 ## Run locally
 
@@ -33,13 +33,18 @@ A hackathon MVP for a student career coaching chatbot with one-time onboarding c
 
 ## Features
 
-- One-time session onboarding with university/major/year/goals
-- Chat-based career coaching powered by Anthropic Claude
-- Suggested reply chips that can be clicked to continue the conversation
-- University-specific opportunity search using a generic web search scraper
-- Plan generation endpoint that summarizes the conversation into actionable next steps
+- One-time onboarding with university, major, year, and career goals
+- Persistent Career Radar with durable opportunities, priorities, statuses, and source links
+- Claude-powered chat that can discover opportunities and update the Career Radar through structured instructions
+- Career Plan generation that summarizes the conversation into actionable next steps
+- Workspace UI that emphasizes the Career Radar over the chat experience
+
+## Database changes
+
+The new schema lives in [supabase_migration.sql](supabase_migration.sql) and adds an opportunities table with indexes and RLS guidance. The rollback script is in [rollback.sql](rollback.sql).
 
 ## Notes
 
 - The app reads credentials from `.env`
-- Do not add user authentication, resume generation, academic advising, or gamification features
+- The backend now exposes opportunity endpoints for create, list, update, and archive flows
+- The app still avoids user authentication, resume generation, academic advising, and gamification features
