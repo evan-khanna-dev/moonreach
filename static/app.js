@@ -326,24 +326,33 @@ const renderNorthStar = (payload) => {
 };
 
 const loadNorthStar = async () => {
+  console.debug("[NorthStar] initialize; session_id =", currentSessionId);
   if (!currentSessionId) {
+    console.debug("[NorthStar] abort: no active session");
     return;
   }
   refreshNorthStarButton.disabled = true;
   refreshNorthStarButton.textContent = "Updating…";
   try {
+    console.debug("[NorthStar] fetch call: POST /north-star body=", { session_id: Number(currentSessionId) });
     const response = await fetch("/north-star", {
       method: "POST",
       headers: getRequestHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ session_id: Number(currentSessionId) }),
     });
+    console.debug("[NorthStar] fetch response status =", response.status);
     if (!response.ok) {
+      const errorBody = await response.text();
+      console.error("[NorthStar] backend error", response.status, errorBody);
+      northstarOutputElement.innerHTML = `<div class="radar-empty radar-error">North Star failed to load (${response.status}). Please try again.</div>`;
       return;
     }
     const payload = await response.json();
+    console.debug("[NorthStar] response received", payload);
     renderNorthStar(payload);
   } catch (error) {
-    console.error(error);
+    console.error("[NorthStar] exception", error);
+    northstarOutputElement.innerHTML = `<div class="radar-empty radar-error">North Star failed to load. Please try again.</div>`;
   } finally {
     refreshNorthStarButton.disabled = false;
     refreshNorthStarButton.textContent = "Refresh";

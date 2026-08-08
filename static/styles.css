@@ -331,6 +331,12 @@ button:hover {
   background: #fafcff;
 }
 
+.radar-error {
+  border-color: #f2b8b5;
+  color: #b3403a;
+  background: #fff7f7;
+}
+
 .chat-card {
   min-height: 320px;
   max-height: 580px;
