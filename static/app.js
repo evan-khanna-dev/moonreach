@@ -278,16 +278,17 @@ const buildNorthStarSection = (label, items) => {
 };
 
 const renderNorthStar = (payload) => {
-  const hasData = payload && payload.current_direction;
-  if (!hasData) {
-    northstarOutputElement.innerHTML = `<div class="radar-empty">North Star is still calibrating. Start a conversation about your goals or opportunities.</div>`;
+  const noEvidence = !payload || payload.has_evidence === false;
+  if (noEvidence) {
+    northstarOutputElement.innerHTML = `<div class="radar-empty">North Star will build itself from everything in your workspace. Add your first opportunity on the Career Radar or share a goal in a short conversation and check back here.</div>`;
     return;
   }
 
-  const direction = payload.current_direction || {};
+  const direction = (payload && payload.current_direction) || {};
   const directionText = direction.direction || "Exploring";
   const confidence = typeof direction.confidence === "number" ? `${direction.confidence}%` : null;
   const alternatives = Array.isArray(direction.alternative_directions) ? direction.alternative_directions : [];
+  const evidence = Array.isArray(direction.evidence) ? direction.evidence : [];
 
   northstarOutputElement.innerHTML = `
     <div class="northstar-direction">
@@ -297,6 +298,11 @@ const renderNorthStar = (payload) => {
         ${confidence ? `<span class="priority-pill">Confidence ${confidence}</span>` : ""}
       </div>
       ${direction.why ? `<p class="northstar-action">${escapeHtml(direction.why)}</p>` : ""}
+      ${
+        evidence.length
+          ? `<ul class="northstar-evidence">${evidence.map((e) => `<li>${escapeHtml(e)}</li>`).join("")}</ul>`
+          : ""
+      }
       ${
         alternatives.length
           ? `<p class="northstar-alts">Alternate paths: ${alternatives.map((a) => `<span class="pill">${escapeHtml(a)}</span>`).join(" ")}</p>`
@@ -318,10 +324,6 @@ const renderNorthStar = (payload) => {
   const upcoming = Array.isArray(payload.upcoming_opportunities) ? payload.upcoming_opportunities.slice(0, 3) : [];
   if (upcoming.length) {
     northstarOutputElement.appendChild(buildNorthStarSection("Upcoming opportunities", upcoming));
-  }
-
-  if (!directionText || (!priorities.length && !risks.length && !upcoming.length)) {
-    northstarOutputElement.innerHTML = `<div class="radar-empty">Not enough evidence yet. Add opportunities and chat about your goals to sharpen your North Star.</div>`;
   }
 };
 

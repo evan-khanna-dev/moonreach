@@ -254,6 +254,28 @@ button:hover {
   color: #fff;
 }
 
+.northstar-evidence {
+  display: grid;
+  gap: 4px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.northstar-evidence li {
+  position: relative;
+  padding-left: 16px;
+  color: #c6d4f2;
+  font-size: 0.9rem;
+}
+
+.northstar-evidence li::before {
+  content: "→";
+  position: absolute;
+  left: 0;
+  color: #ffd166;
+}
+
 .northstar-panel .radar-empty {
   border-color: rgba(255, 255, 255, 0.25);
   color: #dbe4ff;
