@@ -162,6 +162,109 @@ button:hover {
   min-height: 240px;
 }
 
+.northstar-panel {
+  background: linear-gradient(135deg, #14213d 0%, #2e64ff 100%);
+  color: #fff;
+}
+
+.northstar-panel .section-label {
+  color: #b9c8ff;
+}
+
+.northstar-panel .panel-header {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.northstar-panel h2 {
+  color: #fff;
+}
+
+.northstar-panel #refresh-northstar {
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+}
+
+.northstar-panel #refresh-northstar:disabled {
+  opacity: 0.6;
+}
+
+.northstar-section {
+  padding: 12px 0 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.15);
+  margin-top: 12px;
+}
+
+.northstar-section .panel-header {
+  margin-bottom: 8px;
+  border-bottom: 0;
+}
+
+.northstar-direction {
+  padding: 4px 0 8px;
+}
+
+.northstar-direction-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin: 6px 0 8px;
+}
+
+.northstar-direction-row strong {
+  font-size: 1.35rem;
+}
+
+.northstar-block-item {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 14px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.northstar-block-item strong {
+  color: #fff;
+}
+
+.northstar-block-item p {
+  margin: 6px 0 0;
+  color: #dbe4ff;
+  font-size: 0.95rem;
+}
+
+.northstar-block-item .chip {
+  margin-top: 10px;
+  background: #fff;
+  color: #14213d;
+  border: 0;
+}
+
+.northstar-action {
+  color: #cfe0ff !important;
+}
+
+.northstar-alts {
+  font-size: 0.9rem;
+}
+
+.northstar-alts .pill {
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+}
+
+.northstar-panel .radar-empty {
+  border-color: rgba(255, 255, 255, 0.25);
+  color: #dbe4ff;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.northstar-panel .priority-pill {
+  background: #ffd166;
+  color: #14213d;
+}
+
 .radar-list {
   display: grid;
   gap: 12px;

@@ -127,6 +127,10 @@ class PlanRequest(BaseModel):
     session_id: int
 
 
+class NorthStarRequest(BaseModel):
+    session_id: int
+
+
 class OpportunityCreate(BaseModel):
     session_id: int
     title: str
@@ -747,6 +751,138 @@ def compose_plan_prompt(context: Dict[str, str], history: List[Dict[str, str]]) 
     return prompt
 
 
+def compose_north_star_prompt(
+    context: Dict[str, str],
+    opportunities: List[Dict[str, Any]],
+    history: List[Dict[str, str]],
+    plan_items: List[str],
+) -> str:
+    opportunity_lines = []
+    if opportunities:
+        for item in opportunities[:10]:
+            opportunity_lines.append(
+                f"- {item.get('title', 'Untitled')} | id={item.get('id')} | category={item.get('category', 'Other')} | status={item.get('status', 'suggested')} | priority={item.get('priority_score', 5)}/10 | reason={item.get('reason_relevant', '')}"
+            )
+    else:
+        opportunity_lines.append("- (none yet)")
+
+    history_lines = []
+    for item in history[-12:]:
+        role = item["role"].capitalize()
+        history_lines.append(f"{role}: {item['content']}")
+
+    plan_block = "- (no plan generated yet)"
+    if plan_items:
+        plan_block = "- " + "\n- ".join(plan_items)
+
+    prompt = (
+        f"{HUMAN_PROMPT}You are the North Star engine of a student career workspace. "
+        "Your single job is to answer one question about the student: what should they focus on RIGHT NOW? "
+        "You are a synthesis engine, NOT a recommendation engine. Do NOT predict job titles. "
+        "Do NOT invent opportunities, programs, or facts about the student. Everything you say must be grounded in the evidence below. "
+        "Students are not confused about which jobs exist; they are confused about what to do next. Reduce that confusion."
+        "\n\n"
+        "Student profile:\n"
+        f"University: {context['university']}\n"
+        f"Major: {context['major']}\n"
+        f"Year: {context['year']}\n"
+        f"Career goals: {context['goals']}\n\n"
+        "Career Radar (the student's tracked opportunities and statuses):\n"
+        + "\n".join(opportunity_lines) + "\n\n"
+        "Recent conversation history:\n"
+        + ("\n".join(history_lines) if history_lines else "- (no conversation yet)") + "\n\n"
+        "Latest action plan:\n"
+        f"{plan_block}\n\n"
+        "Produce a JSON object with exactly these keys:\n"
+        "- current_direction: object with direction (a short trajectory label such as 'Technology -> AI', 'Product Management', 'Research'), "
+        "confidence (an integer 0-100, ONLY if the evidence clearly supports that direction; omit or null when evidence is thin), "
+        "why (1-2 sentences grounded in evidence), alternative_directions (array of up to 2 short labels, may be empty).\n"
+        "- priorities: array of up to 3 objects, each with title, why (why it matters now), impact (integer 1-10), "
+        "recommended_action (a concrete executable action), action_chip (ONE short sentence the student can send to the chat to act on it).\n"
+        "- risks: array of up to 3 objects, each with title, explanation (why it is a bottleneck), severity (integer 1-10), "
+        "suggested_action (concrete), action_chip (ONE short sentence to act on it). Only surface meaningful, evidence-based risks - "
+        "no generic advice. Return [] if there is genuinely nothing to flag.\n"
+        "- upcoming_opportunities: array of up to 3 objects selected from the radar above, each with title, why (why it deserves attention now, "
+        "mention near-term timing if there is evidence), impact (integer 1-10), recommended_next_action (concrete), action_chip (ONE short sentence to act on it).\n"
+        "\n"
+        "Rules:\n"
+        "- Priorities/recommendations should prioritize existing radar items: raising their status, applying, attending, preparing.\n"
+        "- Confidence must be honest: do not fabricate a high confidence number. If this is a brand-new profile with almost no evidence, "
+        "use a low confidence or null.\n"
+        "- Action chips must be ONE short sentence the student could paste directly into the chat to take the action (e.g. "
+        "help me draft an email about the STEP opportunity, find networking events at the university this month). "
+        "Never use generic text like 'Tell me more' or 'make a plan'.\n"
+        "- Keep the whole plan output under ~550 words.\n"
+        "Do not add any text outside the JSON object."
+        f"{AI_PROMPT}"
+    )
+    return prompt
+
+
+def _score_int(value: Any) -> int:
+    try:
+        return max(1, min(10, int(value)))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _direction_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
+    confidence = raw.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        confidence = None
+    else:
+        confidence = max(0, min(100, int(confidence)))
+    alternatives = raw.get("alternative_directions") or []
+    if not isinstance(alternatives, list):
+        alternatives = []
+    return {
+        "direction": str(raw.get("direction") or "").strip() or "Exploring",
+        "confidence": confidence,
+        "why": str(raw.get("why") or "").strip(),
+        "alternative_directions": [str(a).strip() for a in alternatives if str(a).strip()][:2],
+    }
+
+
+def _item_list(raw: Any, chip_key: str, why_key: str, score_key: str = "impact") -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    items = []
+    for entry in raw[:3]:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title") or entry.get("name") or "").strip()
+        if not title:
+            continue
+        item: Dict[str, Any] = {
+            "title": title,
+            "why": str(entry.get(why_key) or "").strip(),
+            "impact": _score_int(entry.get(score_key)),
+            "recommended_action": str(entry.get("recommended_action") or entry.get("suggested_action") or "").strip(),
+            "action_chip": str(entry.get(chip_key) or "").strip(),
+        }
+        if score_key == "severity":
+            item["severity"] = item.pop("impact")
+        items.append(item)
+    return items
+
+
+def normalize_north_star(parsed: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(parsed, dict):
+        return {
+            "current_direction": {"direction": "Exploring", "confidence": None, "why": "", "alternative_directions": []},
+            "priorities": [],
+            "risks": [],
+            "upcoming_opportunities": [],
+        }
+    direction_raw = parsed.get("current_direction") if isinstance(parsed.get("current_direction"), dict) else {}
+    return {
+        "current_direction": _direction_dict(direction_raw),
+        "priorities": _item_list(parsed.get("priorities"), "action_chip", "why", "impact"),
+        "risks": _item_list(parsed.get("risks"), "action_chip", "explanation", "severity"),
+        "upcoming_opportunities": _item_list(parsed.get("upcoming_opportunities"), "action_chip", "why", "impact"),
+    }
+
+
 # def call_claude(prompt: str, max_tokens: int = 900, temperature: float = 0.7) -> str:
 #     response = anthropic.completions.create(
 #         model=ANTHROPIC_MODEL,
@@ -1017,6 +1153,26 @@ async def generate_plan(payload: PlanRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to save generated plan")
 
     return {"plan": plan_json}
+
+
+@app.post("/north-star")
+async def generate_north_star(payload: NorthStarRequest) -> Dict[str, Any]:
+    session = get_session(payload.session_id)
+    opportunity_service = OpportunityService()
+    opportunities = opportunity_service.get_session_opportunities(payload.session_id)
+    history = get_message_history(payload.session_id)
+    plan_items = get_latest_plan(payload.session_id)
+
+    prompt = compose_north_star_prompt(session, opportunities, history, plan_items)
+    raw_output = call_claude(prompt, max_tokens=900)
+    parsed = parse_json_response(raw_output)
+    logger.info("North Star raw_output length=%s", len(raw_output))
+    if parsed is None:
+        logger.warning(
+            "North Star parse failed; raw output %r",
+            raw_output[:300],
+        )
+    return normalize_north_star(parsed)
 
 
 @app.post("/opportunities")

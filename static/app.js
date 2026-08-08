@@ -12,6 +12,8 @@ const sendButton = document.getElementById("send-message");
 const planButton = document.getElementById("generate-plan");
 const resetButton = document.getElementById("reset-session");
 const newSessionButton = document.getElementById("new-session-button");
+const northstarOutputElement = document.getElementById("northstar-output");
+const refreshNorthStarButton = document.getElementById("refresh-northstar");
 const sessionListElement = document.getElementById("session-list");
 const sessionContextElement = document.getElementById("session-context");
 
@@ -49,6 +51,7 @@ const clearChatState = () => {
   planList.innerHTML = "";
   hideElement(planSection);
   radarListElement.innerHTML = "";
+  northstarOutputElement.innerHTML = `<div class="radar-empty">Analyzing your profile and career radar to find your current direction...</div>`;
 };
 
 const setActiveSession = (sessionId) => {
@@ -218,6 +221,135 @@ const renderRadar = (opportunities) => {
   });
 };
 
+const escapeHtml = (value) =>
+  String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[ch]));
+
+const buildActionChip = (text) => {
+  if (!text) return null;
+  const chip = document.createElement("button");
+  chip.type = "button";
+  chip.className = "chip";
+  chip.textContent = text;
+  chip.addEventListener("click", () => {
+    messageInput.value = text;
+    sendMessage();
+  });
+  return chip;
+};
+
+const buildNorthStarItem = (item) => {
+  const el = document.createElement("div");
+  el.className = "northstar-block-item";
+  const impact = typeof item.impact === "number" ? item.impact : null;
+  const severity = typeof item.severity === "number" ? item.severity : null;
+  const scoreText = impact !== null ? `Impact ${impact}/10` : severity !== null ? `Severity ${severity}/10` : "";
+  el.innerHTML = `
+    <div class="northstar-block-head">
+      <strong>${escapeHtml(item.title)}</strong>
+      ${scoreText ? `<span class="priority-pill">${escapeHtml(scoreText)}</span>` : ""}
+    </div>
+    ${item.why ? `<p>${escapeHtml(item.why)}</p>` : ""}
+    ${item.recommended_action ? `<p class="northstar-action">${escapeHtml(item.recommended_action)}</p>` : ""}
+  `;
+  const chip = buildActionChip(item.action_chip);
+  if (chip) {
+    el.appendChild(chip);
+  }
+  return el;
+};
+
+const buildNorthStarSection = (label, items) => {
+  const block = document.createElement("div");
+  block.className = "northstar-section";
+  const heading = document.createElement("div");
+  heading.className = "panel-header";
+  heading.innerHTML = `<div><p class="section-label">${escapeHtml(label)}</p></div>`;
+  block.appendChild(heading);
+  items.forEach((item) => {
+    block.appendChild(buildNorthStarItem(item));
+  });
+  return block;
+};
+
+const renderNorthStar = (payload) => {
+  const hasData = payload && payload.current_direction;
+  if (!hasData) {
+    northstarOutputElement.innerHTML = `<div class="radar-empty">North Star is still calibrating. Start a conversation about your goals or opportunities.</div>`;
+    return;
+  }
+
+  const direction = payload.current_direction || {};
+  const directionText = direction.direction || "Exploring";
+  const confidence = typeof direction.confidence === "number" ? `${direction.confidence}%` : null;
+  const alternatives = Array.isArray(direction.alternative_directions) ? direction.alternative_directions : [];
+
+  northstarOutputElement.innerHTML = `
+    <div class="northstar-direction">
+      <p class="section-label">Current direction</p>
+      <div class="northstar-direction-row">
+        <strong>${escapeHtml(directionText)}</strong>
+        ${confidence ? `<span class="priority-pill">Confidence ${confidence}</span>` : ""}
+      </div>
+      ${direction.why ? `<p class="northstar-action">${escapeHtml(direction.why)}</p>` : ""}
+      ${
+        alternatives.length
+          ? `<p class="northstar-alts">Alternate paths: ${alternatives.map((a) => `<span class="pill">${escapeHtml(a)}</span>`).join(" ")}</p>`
+          : ""
+      }
+    </div>
+  `;
+
+  const priorities = Array.isArray(payload.priorities) ? payload.priorities.slice(0, 3) : [];
+  if (priorities.length) {
+    northstarOutputElement.appendChild(buildNorthStarSection("Top priorities", priorities));
+  }
+
+  const risks = Array.isArray(payload.risks) ? payload.risks.slice(0, 3) : [];
+  if (risks.length) {
+    northstarOutputElement.appendChild(buildNorthStarSection("Risks to watch", risks));
+  }
+
+  const upcoming = Array.isArray(payload.upcoming_opportunities) ? payload.upcoming_opportunities.slice(0, 3) : [];
+  if (upcoming.length) {
+    northstarOutputElement.appendChild(buildNorthStarSection("Upcoming opportunities", upcoming));
+  }
+
+  if (!directionText || (!priorities.length && !risks.length && !upcoming.length)) {
+    northstarOutputElement.innerHTML = `<div class="radar-empty">Not enough evidence yet. Add opportunities and chat about your goals to sharpen your North Star.</div>`;
+  }
+};
+
+const loadNorthStar = async () => {
+  if (!currentSessionId) {
+    return;
+  }
+  refreshNorthStarButton.disabled = true;
+  refreshNorthStarButton.textContent = "Updating…";
+  try {
+    const response = await fetch("/north-star", {
+      method: "POST",
+      headers: getRequestHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ session_id: Number(currentSessionId) }),
+    });
+    if (!response.ok) {
+      return;
+    }
+    const payload = await response.json();
+    renderNorthStar(payload);
+  } catch (error) {
+    console.error(error);
+  } finally {
+    refreshNorthStarButton.disabled = false;
+    refreshNorthStarButton.textContent = "Refresh";
+  }
+};
+
 const handleError = async (response) => {
   const text = await response.text();
   addMessageBubble("assistant", `Error: ${response.status} ${text}`);
@@ -258,6 +390,7 @@ const sendMessage = async () => {
     addMessageBubble("assistant", data.assistant_response);
     await loadCareerRadar();
     showSuggestedChips(data.suggested_replies || []);
+    loadNorthStar();
   } catch (error) {
     addMessageBubble("assistant", "Unable to reach the server. Please try again.");
     console.error(error);
@@ -303,6 +436,7 @@ const loadHistory = async () => {
     renderPlan(payload.plan);
     await loadCareerRadar();
     showWorkspace();
+    loadNorthStar();
   } catch (error) {
     console.error(error);
     showOnboarding();
@@ -378,6 +512,7 @@ sendButton.addEventListener("click", sendMessage);
 planButton.addEventListener("click", generatePlan);
 resetButton.addEventListener("click", resetSession);
 newSessionButton.addEventListener("click", resetSession);
+refreshNorthStarButton.addEventListener("click", loadNorthStar);
 messageInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
