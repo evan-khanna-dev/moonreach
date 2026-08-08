@@ -1,6 +1,6 @@
--- Example RLS policies for the new opportunities table.
--- These policies assume the backend uses a service role key for writes and the app key for reads.
--- Adjust the auth.uid() checks if you later introduce real user authentication.
+-- Example RLS policies for the opportunities table.
+-- The app is session-based and does not rely on user authentication, so these policies are intentionally permissive.
+-- If you later introduce real authentication, tighten these rules around session ownership instead of auth.uid().
 
 create policy if not exists opportunities_select_policy
   on opportunities for select

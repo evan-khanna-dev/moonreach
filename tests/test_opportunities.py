@@ -23,7 +23,6 @@ class TestOpportunityEndpoints(unittest.TestCase):
             response = self.client.post(
                 "/opportunities",
                 json={"session_id": 7, "title": "Career Fair", "category": "Event", "description": "Fall fair", "reason_relevant": "Great for networking", "priority_score": 8, "status": "suggested", "source_url": "https://example.com"},
-                headers={"X-User-Id": "user-1"},
             )
 
         self.assertEqual(response.status_code, 200)
@@ -40,7 +39,6 @@ class TestOpportunityEndpoints(unittest.TestCase):
             response = self.client.post(
                 "/chat",
                 json={"session_id": 7, "message": "Any events coming up?"},
-                headers={"X-User-Id": "user-1"},
             )
 
         self.assertEqual(response.status_code, 200)

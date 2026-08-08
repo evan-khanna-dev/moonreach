@@ -1,5 +1,4 @@
 const sessionStorageKey = "moonreach_session_id";
-const userStorageKey = "moonreach_user_id";
 const onboardingSection = document.getElementById("onboarding");
 const workspaceSection = document.getElementById("workspace-container");
 const messageArea = document.getElementById("message-area");
@@ -19,20 +18,8 @@ const sessionContextElement = document.getElementById("session-context");
 let currentSessionId = localStorage.getItem(sessionStorageKey);
 let sessions = [];
 
-const getUserId = () => {
-  let userId = localStorage.getItem(userStorageKey);
-  if (!userId) {
-    userId = (window.crypto && typeof window.crypto.randomUUID === "function")
-      ? window.crypto.randomUUID()
-      : `user-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    localStorage.setItem(userStorageKey, userId);
-  }
-  return userId;
-};
-
 const getRequestHeaders = (extraHeaders = {}) => ({
   ...extraHeaders,
-  "X-User-Id": getUserId(),
 });
 
 const showElement = (element) => element.classList.remove("hidden");

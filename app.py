@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import html
@@ -9,7 +10,7 @@ from urllib.parse import quote_plus
 import httpx
 from anthropic import AI_PROMPT, Anthropic, HUMAN_PROMPT
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -18,6 +19,9 @@ from postgrest.exceptions import APIError
 from supabase import create_client
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("moonreach")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -49,9 +53,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount("/static", StaticFiles(directory="static"), name="static")
-
-OWNERSHIP_STORE_PATH = os.getenv("OWNERSHIP_STORE_PATH", os.path.join(os.path.dirname(__file__), ".ownership_store.json"))
-
 
 def execute_db(operation, require_service_role: bool = False):
     try:
@@ -233,7 +234,13 @@ class OpportunityService:
             "created_at": self._now(),
             "updated_at": self._now(),
         }
-        response = execute_db(self.table.insert(insert_payload).select("*"))
+        try:
+            print("INSERT PAYLOAD", insert_payload)
+            response = self.table.insert(insert_payload).select("*").execute()
+        except Exception as exc:
+            print("SUPABASE ERROR:", exc)
+
+        print("RAW RESPONSE", response)
         if not getattr(response, "data", None):
             raise HTTPException(status_code=500, detail="Failed to create opportunity")
         return response.data[0]
@@ -344,13 +351,65 @@ def format_search_summary(query: str, results: List[Dict[str, str]]) -> str:
 
 
 def parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
-    raw = raw.strip()
-    for candidate in [raw, raw[raw.find("{"): raw.rfind("}") + 1] if "{" in raw and "}" in raw else [raw]]:
+    if not isinstance(raw, str):
+        return None
+
+    def try_parse(candidate: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(candidate, str):
+            return None
+        cleaned = candidate.strip()
+        if not cleaned:
+            return None
+
+        fenced_blocks = re.findall(r"```(?:json)?\s*(.*?)```", cleaned, flags=re.IGNORECASE | re.S)
+        if fenced_blocks:
+            cleaned = fenced_blocks[0].strip()
+        elif cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE).strip()
+        if cleaned.startswith("`json"):
+            cleaned = re.sub(r"^`json\s*", "", cleaned, flags=re.IGNORECASE).strip()
+        if cleaned.startswith("`") and cleaned.endswith("`"):
+            cleaned = cleaned[1:-1].strip()
+
+        if cleaned.startswith('"') and cleaned.endswith('"'):
+            inner = cleaned[1:-1]
+            if inner:
+                parsed = try_parse(inner)
+                if parsed is not None:
+                    return parsed
+
+        if "{" in cleaned and "}" in cleaned:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if 0 <= start < end:
+                candidates = [cleaned, cleaned[start : end + 1]]
+                for item in candidates:
+                    try:
+                        parsed = json.loads(item)
+                    except Exception:
+                        continue
+                    if isinstance(parsed, dict):
+                        return parsed
         try:
-            return json.loads(candidate)
+            parsed = json.loads(cleaned)
         except Exception:
-            continue
-    return None
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    parsed = try_parse(raw)
+    if not isinstance(parsed, dict):
+        return None
+
+    if isinstance(parsed.get("assistant_response"), str):
+        nested = try_parse(parsed["assistant_response"])
+        if isinstance(nested, dict):
+            merged = dict(parsed)
+            for key in ("assistant_response", "suggested_replies", "career_radar_updates"):
+                if key in nested:
+                    merged[key] = nested[key]
+            return merged
+
+    return parsed
 
 
 def compose_coach_prompt(
@@ -448,7 +507,7 @@ def compose_plan_prompt(context: Dict[str, str], history: List[Dict[str, str]]) 
 #     )
 #     return response["completion"] if isinstance(response, dict) else getattr(response, "completion", "")
 
-def call_claude(prompt: str, max_tokens: int = 900, temperature: float = 0.7) -> str:
+def call_claude(prompt: str, max_tokens: int = 2000, temperature: float = 0.7) -> str:
     response = anthropic.messages.create(
         model=ANTHROPIC_MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -465,84 +524,18 @@ def call_claude(prompt: str, max_tokens: int = 900, temperature: float = 0.7) ->
             assistant_text += getattr(block, "text", "") or ""
     return assistant_text.strip()
 
-def load_ownership_store() -> Dict[str, Any]:
-    if not os.path.exists(OWNERSHIP_STORE_PATH):
-        return {}
-    try:
-        with open(OWNERSHIP_STORE_PATH, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-            return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_ownership_store(store: Dict[str, Any]) -> None:
-    directory = os.path.dirname(OWNERSHIP_STORE_PATH)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    with open(OWNERSHIP_STORE_PATH, "w", encoding="utf-8") as handle:
-        json.dump(store, handle)
-
-
-def get_session_owner(session_id: int) -> Optional[str]:
-    store = load_ownership_store()
-    owner = store.get("sessions", {}).get(str(session_id))
-    return owner if isinstance(owner, str) and owner.strip() else None
-
-
-def set_session_owner(session_id: int, user_id: str) -> None:
-    store = load_ownership_store()
-    store.setdefault("sessions", {})[str(session_id)] = user_id
-    save_ownership_store(store)
-
-
-def get_current_user_id(request: Request) -> str:
-    user_id = (request.headers.get("x-user-id") or "").strip()
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User identity is required")
-    return user_id
-
-
-def require_session_access(session_id: int, user_id: str, session: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User identity is required")
-
-    if session is None:
-        session = get_session(session_id)
-
-    session_owner = session.get("user_id") if isinstance(session, dict) else None
-    if isinstance(session_owner, str) and session_owner.strip() and str(session_owner).strip() != str(user_id):
-        raise HTTPException(status_code=403, detail="You do not have access to this session")
-
-    owner_mapping = get_session_owner(session_id)
-    if owner_mapping and str(owner_mapping).strip() != str(user_id):
-        raise HTTPException(status_code=403, detail="You do not have access to this session")
-
-    if session_owner is None and owner_mapping is None:
-        raise HTTPException(status_code=403, detail="You do not have access to this session")
-
-    return session
-
-
-def get_session(session_id: int, user_id: Optional[str] = None, require_ownership: bool = False) -> Dict[str, str]:
+def get_session(session_id: int) -> Dict[str, str]:
     response = execute_db(
         db_table("sessions")
-        .select("id, university, major, year, goals, user_id")
+        .select("id, university, major, year, goals")
         .eq("id", session_id)
     )
     if not getattr(response, "data", None):
         raise HTTPException(status_code=404, detail="Session not found")
-    session = response.data[0]
-    if require_ownership and user_id:
-        require_session_access(session_id, user_id, session)
-    return session
+    return response.data[0]
 
 
-def get_message_history(
-    session_id: int, user_id: Optional[str] = None, require_ownership: bool = False
-) -> List[Dict[str, str]]:
-    if require_ownership and user_id:
-        get_session(session_id, user_id=user_id, require_ownership=True)
+def get_message_history(session_id: int) -> List[Dict[str, str]]:
     response = execute_db(
         db_table("messages")
         .select("role, content")
@@ -566,11 +559,7 @@ def normalize_plan_items(raw_plan: Any) -> List[str]:
     return []
 
 
-def get_latest_plan(
-    session_id: int, user_id: Optional[str] = None, require_ownership: bool = False
-) -> List[str]:
-    if require_ownership and user_id:
-        get_session(session_id, user_id=user_id, require_ownership=True)
+def get_latest_plan(session_id: int) -> List[str]:
     response = execute_db(
         db_table("plans")
         .select("plan_items")
@@ -584,31 +573,18 @@ def get_latest_plan(
 
 
 @app.get("/sessions")
-async def list_sessions(request: Request) -> Dict[str, Any]:
-    user_id = get_current_user_id(request)
+async def list_sessions() -> Dict[str, Any]:
     response = execute_db(
         db_table("sessions")
-        .select("id, university, major, year, goals, created_at, user_id")
+        .select("id, university, major, year, goals, created_at")
         .order("created_at", desc=True)
     )
     sessions = getattr(response, "data", None) or []
-    owned_sessions = []
-    for item in sessions:
-        session_id = item.get("id")
-        if not session_id:
-            continue
-        session_owner = item.get("user_id")
-        owner_mapping = get_session_owner(session_id)
-        if isinstance(session_owner, str) and session_owner.strip() and str(session_owner) == str(user_id):
-            owned_sessions.append(item)
-        elif owner_mapping and str(owner_mapping) == str(user_id):
-            owned_sessions.append(item)
-    return {"sessions": owned_sessions}
+    return {"sessions": sessions}
 
 
 @app.post("/session")
-async def create_session(session: SessionCreate, request: Request) -> Dict[str, int]:
-    user_id = get_current_user_id(request)
+async def create_session(session: SessionCreate) -> Dict[str, int]:
     response = execute_db(
         db_table("sessions")
         .insert(
@@ -626,14 +602,12 @@ async def create_session(session: SessionCreate, request: Request) -> Dict[str, 
         raise HTTPException(status_code=500, detail="Failed to create session")
 
     created_session_id = response.data[0]["id"]
-    set_session_owner(created_session_id, user_id)
     return {"session_id": created_session_id}
 
 
 @app.post("/chat")
-async def chat(payload: ChatRequest, request: Request) -> Dict[str, Any]:
-    user_id = get_current_user_id(request)
-    session = get_session(payload.session_id, user_id=user_id, require_ownership=True)
+async def chat(payload: ChatRequest) -> Dict[str, Any]:
+    session = get_session(payload.session_id)
     user_text = payload.message.strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
@@ -646,7 +620,7 @@ async def chat(payload: ChatRequest, request: Request) -> Dict[str, Any]:
     if not getattr(insert_response, "data", None):
         raise HTTPException(status_code=500, detail="Failed to save user message")
 
-    history = get_message_history(payload.session_id, user_id=user_id, require_ownership=True)
+    history = get_message_history(payload.session_id)
     opportunity_service = OpportunityService()
     existing_opportunities = opportunity_service.get_session_opportunities(payload.session_id)
     search_summary = None
@@ -660,7 +634,14 @@ async def chat(payload: ChatRequest, request: Request) -> Dict[str, Any]:
     prompt = compose_coach_prompt(session, history, user_text, search_summary, opportunities=existing_opportunities)
     raw_output = call_claude(prompt)
     parsed = parse_json_response(raw_output)
+    logger.info("Claude raw_output length=%s", len(raw_output))
+    logger.info("Claude parsed_payload=%s", parsed)
     if parsed is None or "assistant_response" not in parsed:
+        logger.warning(
+            "Claude payload fallback triggered; parse_json_response returned %s for raw output %s",
+            parsed,
+            raw_output,
+        )
         parsed = {
             "assistant_response": raw_output.strip(),
             "suggested_replies": [
@@ -681,7 +662,9 @@ async def chat(payload: ChatRequest, request: Request) -> Dict[str, Any]:
         if not isinstance(parsed.get("career_radar_updates"), list):
             parsed["career_radar_updates"] = []
 
-    assistant_text = str(parsed["assistant_response"]).strip()
+    assistant_text = str(parsed.get("assistant_response") or "").strip()
+    if not assistant_text and isinstance(parsed.get("assistant_response"), str):
+        assistant_text = str(parsed["assistant_response"]).strip()
     save_response = execute_db(
         db_table("messages").insert(
             {"session_id": payload.session_id, "role": "assistant", "content": assistant_text}
@@ -756,10 +739,9 @@ async def chat(payload: ChatRequest, request: Request) -> Dict[str, Any]:
 
 
 @app.post("/plan")
-async def generate_plan(payload: PlanRequest, request: Request) -> Dict[str, Any]:
-    user_id = get_current_user_id(request)
-    session = get_session(payload.session_id, user_id=user_id, require_ownership=True)
-    history = get_message_history(payload.session_id, user_id=user_id, require_ownership=True)
+async def generate_plan(payload: PlanRequest) -> Dict[str, Any]:
+    session = get_session(payload.session_id)
+    history = get_message_history(payload.session_id)
     if not history:
         raise HTTPException(status_code=404, detail="No conversation history found for this session")
 
@@ -789,52 +771,46 @@ async def generate_plan(payload: PlanRequest, request: Request) -> Dict[str, Any
 
 
 @app.post("/opportunities")
-async def create_opportunity(payload: OpportunityCreate, request: Request) -> Dict[str, Any]:
-    user_id = get_current_user_id(request)
-    get_session(payload.session_id, user_id=user_id, require_ownership=True)
+async def create_opportunity(payload: OpportunityCreate) -> Dict[str, Any]:
+    get_session(payload.session_id)
     service = OpportunityService()
     created = service.create_opportunity(payload.session_id, payload.dict())
     return {"opportunity": created}
 
 
 @app.get("/opportunities/{session_id}")
-async def list_opportunities(session_id: int, request: Request) -> Dict[str, Any]:
-    user_id = get_current_user_id(request)
-    get_session(session_id, user_id=user_id, require_ownership=True)
+async def list_opportunities(session_id: int) -> Dict[str, Any]:
+    get_session(session_id)
     service = OpportunityService()
     return {"opportunities": service.get_session_opportunities(session_id)}
 
 
 @app.patch("/opportunities/{opportunity_id}")
-async def update_opportunity(opportunity_id: int, payload: OpportunityUpdate, request: Request) -> Dict[str, Any]:
-    user_id = get_current_user_id(request)
+async def update_opportunity(opportunity_id: int, payload: OpportunityUpdate) -> Dict[str, Any]:
     service = OpportunityService()
     updated = service.update_opportunity(opportunity_id, payload.dict(exclude_none=True))
     return {"opportunity": updated}
 
 
 @app.delete("/opportunities/{opportunity_id}")
-async def delete_opportunity(opportunity_id: int, request: Request) -> Dict[str, Any]:
-    user_id = get_current_user_id(request)
+async def delete_opportunity(opportunity_id: int) -> Dict[str, Any]:
     service = OpportunityService()
     archived = service.archive_opportunity(opportunity_id)
     return {"opportunity": archived}
 
 
 @app.get("/career-radar/{session_id}")
-async def career_radar(session_id: int, request: Request) -> Dict[str, Any]:
-    user_id = get_current_user_id(request)
-    get_session(session_id, user_id=user_id, require_ownership=True)
+async def career_radar(session_id: int) -> Dict[str, Any]:
+    get_session(session_id)
     service = OpportunityService()
     return {"opportunities": service.get_session_opportunities(session_id)}
 
 
 @app.get("/session/{session_id}/history")
-async def session_history(session_id: int, request: Request) -> Dict[str, Any]:
-    user_id = get_current_user_id(request)
-    session = get_session(session_id, user_id=user_id, require_ownership=True)
-    messages = get_message_history(session_id, user_id=user_id, require_ownership=True)
-    plan = get_latest_plan(session_id, user_id=user_id, require_ownership=True)
+async def session_history(session_id: int) -> Dict[str, Any]:
+    session = get_session(session_id)
+    messages = get_message_history(session_id)
+    plan = get_latest_plan(session_id)
     return {"session": session, "messages": messages, "plan": plan}
 
 

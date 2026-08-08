@@ -21,13 +21,13 @@ class TestSessionHistoryEndpoints(unittest.TestCase):
     def test_list_sessions_returns_all_sessions(self):
         fake_response = SimpleNamespace(
             data=[
-                {"id": 1, "university": "Test University", "major": "Computer Science", "year": "Junior", "goals": "internships", "user_id": "user-1"},
-                {"id": 2, "university": "Another University", "major": "Data Science", "year": "Senior", "goals": "full-time roles", "user_id": "user-1"},
+                {"id": 1, "university": "Test University", "major": "Computer Science", "year": "Junior", "goals": "internships"},
+                {"id": 2, "university": "Another University", "major": "Data Science", "year": "Senior", "goals": "full-time roles"},
             ]
         )
 
         with patch.object(app_module, "execute_db", return_value=fake_response):
-            response = self.client.get("/sessions", headers={"X-User-Id": "user-1"})
+            response = self.client.get("/sessions")
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -39,7 +39,7 @@ class TestSessionHistoryEndpoints(unittest.TestCase):
         with patch.object(app_module, "get_session", return_value={"id": 7, "university": "Test University", "major": "Design", "year": "Sophomore", "goals": "portfolio"}), \
              patch.object(app_module, "get_message_history", return_value=[{"role": "user", "content": "Hello"}]), \
              patch.object(app_module, "get_latest_plan", return_value=["Reach out to alumni"]):
-            response = self.client.get("/session/7/history", headers={"X-User-Id": "user-1"})
+            response = self.client.get("/session/7/history")
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -47,10 +47,16 @@ class TestSessionHistoryEndpoints(unittest.TestCase):
         self.assertEqual(body["messages"][0]["content"], "Hello")
         self.assertEqual(body["plan"][0], "Reach out to alumni")
 
-    def test_chat_requires_ownership_context(self):
-        def fake_get_session(session_id, user_id=None, require_ownership=False):
-            self.assertEqual(user_id, "user-1")
-            self.assertTrue(require_ownership)
+    def test_parse_json_response_unwraps_nested_assistant_payloads(self):
+        raw = '{"assistant_response": "`json {\\"assistant_response\\": \\"Hello from Claude\\", \\"suggested_replies\\": [\\"Next step\\"], \\"career_radar_updates\\": []}"}'
+        parsed = app_module.parse_json_response(raw)
+
+        self.assertEqual(parsed["assistant_response"], "Hello from Claude")
+        self.assertEqual(parsed["suggested_replies"], ["Next step"])
+        self.assertEqual(parsed["career_radar_updates"], [])
+
+    def test_chat_uses_session_context(self):
+        def fake_get_session(session_id):
             return {"id": session_id, "university": "Test", "major": "CS", "year": "Junior", "goals": "internships"}
 
         with patch.object(app_module, "get_session", side_effect=fake_get_session), \
@@ -61,7 +67,6 @@ class TestSessionHistoryEndpoints(unittest.TestCase):
             response = self.client.post(
                 "/chat",
                 json={"session_id": 7, "message": "Hello"},
-                headers={"X-User-Id": "user-1"},
             )
 
         self.assertEqual(response.status_code, 200)
