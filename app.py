@@ -1,3 +1,4 @@
+import difflib
 import json
 import logging
 import os
@@ -196,6 +197,95 @@ def normalize_priority_score(value: Any) -> int:
     return max(1, min(10, numeric))
 
 
+STATUS_LIFECYCLE_ORDER = ["suggested", "interested", "exploring", "applied", "completed", "archived"]
+
+# Documented forward-only transitions. Archived is a terminal state (only reachable, not escapable).
+RECOMMENDED_STATUS_TRANSITIONS = {
+    "suggested": {"interested", "exploring", "applied", "completed", "archived"},
+    "interested": {"exploring", "applied", "completed", "archived"},
+    "exploring": {"applied", "completed", "archived"},
+    "applied": {"completed", "archived"},
+    "completed": {"archived"},
+    "archived": set(),
+}
+
+DUPLICATE_TITLE_SIMILARITY_THRESHOLD = 0.6
+DUPLICATE_SOURCE_URL_MATCH_THRESHOLD = 0.9
+
+# Generic career words that should never by themselves identify a specific
+# opportunity. A reference consisting only of these is too vague to match.
+GENERIC_TITLE_TOKENS = {
+    "intern", "internship", "internships", "opportunity", "opportunities",
+    "job", "jobs", "career", "careers", "fair", "event", "events", "program",
+    "programs", "scholarship", "scholarships", "application", "applications",
+    "club", "clubs", "research", "volunteer", "fellowship", "fellowships",
+}
+
+
+def transition_status(current_status: Optional[str], new_status: str) -> bool:
+    """Return True when moving from current_status to new_status is sensible.
+
+    Forward transitions follow RECOMMENDED_STATUS_TRANSITIONS. Any transition to a
+    later state is allowed as well (e.g. suggested -> applied), while regressions
+    (e.g. applied -> suggested) are rejected so the radar never moves backwards.
+    """
+    if not isinstance(new_status, str):
+        return False
+    new_status = new_status.lower()
+    if new_status not in VALID_OPPORTUNITY_STATUSES:
+        return False
+    current = (current_status or "suggested").strip().lower()
+    if current not in VALID_OPPORTUNITY_STATUSES:
+        current = "suggested"
+    if current == new_status:
+        return True
+    allowed = RECOMMENDED_STATUS_TRANSITIONS.get(current, set())
+    if new_status in allowed:
+        return True
+    current_idx = STATUS_LIFECYCLE_ORDER.index(current) if current in STATUS_LIFECYCLE_ORDER else 0
+    new_idx = STATUS_LIFECYCLE_ORDER.index(new_status) if new_status in STATUS_LIFECYCLE_ORDER else len(STATUS_LIFECYCLE_ORDER)
+    return new_idx > current_idx
+
+
+def title_similarity(a: str, b: str) -> float:
+    """Return a 0..1 similarity for two opportunity titles.
+
+    Combines exact token containment (catching partial / abbreviated references like
+    "STEP" vs "Google STEP Internship") with a fuzzy sequence ratio and Jaccard.
+    References made entirely of generic career words are deliberately discounted so
+    a vague phrase like "internship" never drives a duplicate match on its own.
+    """
+    def tokens(value: str) -> List[str]:
+        return [tok for tok in re.split(r"[^a-z0-9]+", str(value).lower()) if tok]
+
+    ta = tokens(a)
+    tb = tokens(b)
+    if not ta or not tb:
+        return 0.0
+    if ta == tb:
+        return 1.0
+
+    set_a, set_b = set(ta), set(tb)
+    common = set_a & set_b
+    jaccard = len(common) / len(set_a | set_b)
+    containment = max(len(common) / len(set_a), len(common) / len(set_b))
+    ratio = difflib.SequenceMatcher(None, ta, tb).ratio()
+
+    score = max(jaccard, containment * 0.9, ratio)
+    generic_only = set_a.issubset(GENERIC_TITLE_TOKENS) or set_b.issubset(GENERIC_TITLE_TOKENS)
+    if generic_only and not common - GENERIC_TITLE_TOKENS:
+        score *= 0.5
+    return score
+
+
+def source_url_similarity(a: Optional[str], b: Optional[str]) -> float:
+    if not a or not b:
+        return 0.0
+    def norm(value: str) -> str:
+        return re.sub(r"^https?://", "", value.strip().lower()).rstrip("/")
+    return difflib.SequenceMatcher(None, norm(a), norm(b)).ratio()
+
+
 class OpportunityService:
     def __init__(self) -> None:
         self.table = db_table("opportunities")
@@ -269,24 +359,60 @@ class OpportunityService:
         )
         return getattr(response, "data", None) or []
 
-    def find_duplicate_opportunity(self, session_id: int, candidate: Dict[str, Any], existing_opportunities: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    def find_matching_opportunity(
+        self,
+        session_id: int,
+        title: Optional[str],
+        source_url: Optional[str] = None,
+        category: Optional[str] = None,
+        existing_opportunities: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a candidate (by title/source_url) to an existing radar row.
+
+        Returns the best non-archived match above the similarity threshold, or None.
+        """
         opportunities = existing_opportunities if existing_opportunities is not None else self.get_session_opportunities(session_id)
-        normalized_title = self._normalize_text(candidate.get("title") or "")
-        candidate_source = str(candidate.get("source_url") or "").strip().lower()
-        if not normalized_title and not candidate_source:
-            return None
-        for opportunity in opportunities:
-            if not isinstance(opportunity, dict):
-                continue
-            if str(opportunity.get("status") or "").lower() == "archived":
-                continue
-            existing_title = self._normalize_text(opportunity.get("title") or "")
-            existing_source = str(opportunity.get("source_url") or "").strip().lower()
-            if existing_title and normalized_title and existing_title == normalized_title:
-                return opportunity
-            if candidate_source and existing_source and candidate_source == existing_source:
-                return opportunity
+        candidates = [o for o in opportunities if isinstance(o, dict) and str(o.get("status") or "").lower() != "archived"]
+
+        title_match: Optional[Dict[str, Any]] = None
+        title_score = 0.0
+        source_match: Optional[Dict[str, Any]] = None
+        source_score = 0.0
+
+        for opportunity in candidates:
+            claimed = str(title or "").strip()
+            existing_title = str(opportunity.get("title") or "").strip()
+            if claimed and existing_title:
+                score = title_similarity(claimed, existing_title)
+                if score > title_score:
+                    title_score, title_match = score, opportunity
+
+            cand_source = str(source_url or "").strip()
+            existing_source = str(opportunity.get("source_url") or "").strip()
+            if cand_source and existing_source:
+                score = source_url_similarity(cand_source, existing_source)
+                if score > source_score:
+                    source_score, source_match = score, opportunity
+
+        if source_match and source_score >= DUPLICATE_SOURCE_URL_MATCH_THRESHOLD:
+            return source_match
+        if (
+            title_match
+            and title_score >= DUPLICATE_TITLE_SIMILARITY_THRESHOLD
+            and (not category or not title_match.get("category") or title_match.get("category") == category)
+        ):
+            return title_match
         return None
+
+    def find_duplicate_opportunity(self, session_id: int, candidate: Dict[str, Any], existing_opportunities: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+        """DEPRECATED - resolves a candidate payload to an existing opportunity via fuzzy matching."""
+        return self.find_matching_opportunity(
+            session_id,
+            title=str(candidate.get("title") or "").strip() or None,
+            source_url=str(candidate.get("source_url") or "").strip() or None,
+            category=str(candidate.get("category") or "").strip() or None,
+            existing_opportunities=existing_opportunities,
+        )
 
     def update_priority(self, opportunity_id: int, priority_score: int) -> Dict[str, Any]:
         return self.update_opportunity(opportunity_id, {"priority_score": priority_score})
@@ -296,6 +422,109 @@ class OpportunityService:
 
     def _normalize_text(self, value: str) -> str:
         return re.sub(r"\W+", " ", str(value).strip().lower()).strip()
+
+
+STRONG_INTEREST_MARKERS = [
+    "really want", "really excited", "top choice", "love", "favorite", "excited about",
+    "priority", "dream", "first choice", "high priority", "pursue this", "committed",
+    "must do", "definitely", "heavily interested",
+]
+DISINTEREST_MARKERS = [
+    "not interested", "no longer interested", "don't care", "do not care", "skip",
+    "not for me", "bored", "dropping", "won't", "not attending", "pass on",
+    "doesn't interest", "not really feeling",
+]
+
+
+def detect_priority_signal(user_message: str) -> int:
+    """Return +1 for strong interest, -1 for disinterest, 0 otherwise."""
+    lowered = user_message.lower()
+    if any(marker in lowered for marker in DISINTEREST_MARKERS):
+        return -1
+    if any(marker in lowered for marker in STRONG_INTEREST_MARKERS):
+        return 1
+    return 0
+
+
+def resolve_opportunity_target(
+    service: OpportunityService,
+    existing_opportunities: List[Dict[str, Any]],
+    update: Dict[str, Any],
+    session_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Resolve an update clause to an existing opportunity row.
+
+    Preference order:
+    1) explicit opportunity_id (or item id)
+    2) a title/source_url fuzzy match against the current radar
+    """
+    opportunity_id = update.get("opportunity_id") or update.get("id")
+    if opportunity_id is not None:
+        try:
+            target_id = int(opportunity_id)
+        except (TypeError, ValueError):
+            target_id = None
+        if target_id is not None:
+            for opp in existing_opportunities:
+                if int(opp.get("id") or -1) == target_id:
+                    return opp
+            return None
+    claimed_title = str(update.get("title") or "").strip() or None
+    claimed_source = str(update.get("source_url") or "").strip() or None
+    if claimed_title or claimed_source:
+        matched = service.find_matching_opportunity(
+            session_id,
+            title=claimed_title,
+            source_url=claimed_source,
+            category=str(update.get("category") or "").strip() or None,
+            existing_opportunities=existing_opportunities,
+        )
+        if matched:
+            return matched
+    return None
+
+
+def merge_opportunity_update(
+    service: OpportunityService,
+    existing: Dict[str, Any],
+    update: Dict[str, Any],
+    session_id: int,
+) -> Dict[str, Any]:
+    """Merge a partial Claude update into an existing radar row.
+
+    Enforces status transitions and re-applies the priority clamp so the radar
+    always moves forward rather than rewriting from scratch.
+    """
+    payload: Dict[str, Any] = {}
+    for field in ("category", "description", "reason_relevant", "source_url"):
+        if update.get(field) not in (None, ""):
+            payload[field] = update.get(field)
+
+    new_title = str(update.get("title") or "").strip()
+    if new_title and title_similarity(new_title, str(existing.get("title") or "")) < 0.8:
+        payload["title"] = new_title
+
+    new_status = update.get("status")
+    should_change_status = False
+    if isinstance(new_status, str):
+        candidate_status = normalize_status(new_status)
+        should_change_status = transition_status(existing.get("status"), candidate_status)
+    if should_change_status:
+        payload["status"] = normalize_status(new_status)
+    elif new_status and not should_change_status:
+        logger.info(
+            "Rejected invalid status transition for opportunity %s: %r -> %r",
+            existing.get("id"), existing.get("status"), new_status,
+        )
+
+    priority_score = update.get("priority_score")
+    if priority_score is not None:
+        payload["priority_score"] = normalize_priority_score(priority_score)
+
+    if not payload:
+        return existing
+    updated = service.update_opportunity(int(existing["id"]), payload)
+    return updated
 
 
 def clean_text(raw: str) -> str:
@@ -435,10 +664,10 @@ def compose_coach_prompt(
 
     opportunity_block = ""
     if opportunities:
-        opportunity_lines = ["Existing Career Radar items:"]
+        opportunity_lines = ["Existing Career Radar items (id is required to update an existing item):"]
         for item in opportunities[:8]:
             opportunity_lines.append(
-                f"- {item.get('title', 'Untitled')} | category={item.get('category', 'Other')} | status={item.get('status', 'suggested')} | priority={item.get('priority_score', 5)} | reason={item.get('reason_relevant', '')}"
+                f"- id={item.get('id')} | title={item.get('title', 'Untitled')} | category={item.get('category', 'Other')} | status={item.get('status', 'suggested')} | priority={item.get('priority_score', 5)} | reason={item.get('reason_relevant', '')}"
             )
         opportunity_block = "\n".join(opportunity_lines) + "\n\n"
 
@@ -458,14 +687,35 @@ def compose_coach_prompt(
         f"{conversation_text}\n\n"
         f"User: {user_message}\n\n"
         f"{search_block}"
-        "Your two jobs are:\n"
-        "1. Answer the student's question naturally.\n"
-        "2. Decide whether the Career Radar should be updated with new opportunities, priority changes, status changes, or archived items.\n"
+        "Your three jobs are:\n"
+        "1. Answer the student's question naturally and empathetically.\n"
+        "2. Suggest 3 short, sensible next-user prompts.\n"
+        "3. Keep the Career Radar accurate and \"alive\": meaningfully evolve the matching opportunities instead of endlessly generating new ones.\n"
+        "\n"
+        "Career Radar update rules (career_radar_updates):\n"
+        "- The radar is a live tracking workspace, not a static recommendation list. Every chat must EITHER create a genuinely new opportunity OR make an existing one more accurate.\n"
+        "- When the user references an opportunity that already exists (same title, an abbreviation, a partial match, or an obvious conversational reference like \"STEP\", \"ACM\", \"the hackathon\", \"that Google one\"), you MUST update the existing item — never create a duplicate.\n"
+        "- The `Existing Career Radar items` list above shows the ids. To modify an existing item include its `id` as `opportunity_id` in your update clause. New items created for the first time need no id.\n"
+        "- Adding a new opportunity is the LAST RESORT — only for something genuinely not present on the radar.\n"
+        "- Each clause is one of: add, update, reprioritize, or archive.\n"
+        "  - update: change status, category, title, description, or reason for an EXISTING item (set opportunity_id). Prefer this action for nearly all adjustments.\n"
+        "  - reprioritize: change priority_score of an existing item (set opportunity_id) when the user expresses strong interest (raise) or disinterest (lower).\n"
+        "  - archive: mark an existing item archived when it is no longer relevant (set opportunity_id).\n"
+        "  - add: only for a brand-new opportunity not already on the radar.\n"
+        "Status meanings and transitions (status):\n"
+        "- suggested: surfaced and worth watching\n"
+        "- interested: user is thinking about / attracted to it\n"
+        "- exploring: user is actively researching\n"
+        "- applied: user has applied\n"
+        "- completed: user finished the activity, e.g. attended a fair or finished a program\n"
+        "- archived: no longer tracking\n"
+        "- Move status FORWARD along suggested -> interested -> exploring -> applied -> completed (esp. when the user mentions applying, attending, or expressing interest). Never move backwards.\n"
+        "Priority (priority_score, 1-10, default 5): raise when the user is strongly excited (e.g. \"I really want this\") and lower when the user seems uninterested or dismissive.\n"
         "Return only a valid JSON object with the keys\n"
         "- assistant_response: the coaching reply\n"
         "- suggested_replies: a short list of 3 next-user prompts relevant to the conversation\n"
-        "- career_radar_updates: an array of objects with action, title, category, description, reason_relevant, priority_score, status, source_url\n"
-        "If nothing should change, use an empty array.\n"
+        "- career_radar_updates: an array of update objects (empty array if nothing should change)\n"
+        "Update object shape (only include fields that change): action, opportunity_id, title, category, description, reason_relevant, priority_score, status, source_url\n"
         "Do not add any additional text outside the JSON object."
         f"{AI_PROMPT}"
     )
@@ -674,23 +924,25 @@ async def chat(payload: ChatRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to save assistant response")
 
     applied_updates = []
+    priority_signal = detect_priority_signal(user_text)
     for update in parsed.get("career_radar_updates", []):
+        if not isinstance(update, dict):
+            continue
         action = str(update.get("action") or "").strip().lower()
         if action not in {"add", "update", "archive", "reprioritize"}:
             continue
+
         if action == "add":
-            existing = opportunity_service.find_duplicate_opportunity(payload.session_id, update, existing_opportunities)
+            existing = opportunity_service.find_matching_opportunity(
+                payload.session_id,
+                title=str(update.get("title") or "").strip() or None,
+                source_url=str(update.get("source_url") or "").strip() or None,
+                category=str(update.get("category") or "").strip() or None,
+                existing_opportunities=existing_opportunities,
+            )
             if existing:
-                updated = opportunity_service.update_opportunity(int(existing["id"]), {
-                    "title": update.get("title") or existing.get("title"),
-                    "category": update.get("category") or existing.get("category"),
-                    "description": update.get("description") or existing.get("description"),
-                    "reason_relevant": update.get("reason_relevant") or existing.get("reason_relevant"),
-                    "source_url": update.get("source_url") or existing.get("source_url"),
-                    "priority_score": update.get("priority_score") or existing.get("priority_score"),
-                    "status": update.get("status") or existing.get("status") or "suggested",
-                })
-                applied_updates.append({"action": "update", "opportunity": updated})
+                updated = merge_opportunity_update(opportunity_service, existing, update, payload.session_id)
+                applied_updates.append({"action": "update", "opportunity": updated, "matched": True})
                 continue
             created = opportunity_service.create_opportunity(payload.session_id, {
                 "title": update.get("title") or "Untitled opportunity",
@@ -698,37 +950,34 @@ async def chat(payload: ChatRequest) -> Dict[str, Any]:
                 "description": update.get("description") or "",
                 "reason_relevant": update.get("reason_relevant") or "",
                 "source_url": update.get("source_url"),
-                "priority_score": update.get("priority_score"),
+                "priority_score": update.get("priority_score") or 5 + max(priority_signal, 0),
                 "status": update.get("status") or "suggested",
             })
             applied_updates.append({"action": "add", "opportunity": created})
-        elif action == "update":
-            opportunity_id = update.get("opportunity_id")
-            if opportunity_id is None:
+        elif action in {"update", "reprioritize", "archive"}:
+            existing = resolve_opportunity_target(opportunity_service, existing_opportunities, update, payload.session_id)
+            if existing is None:
+                logger.info("Career Radar update skipped: no match for %s", update.get("title") or update.get("opportunity_id"))
                 continue
-            updated = opportunity_service.update_opportunity(int(opportunity_id), {
-                "title": update.get("title"),
-                "category": update.get("category"),
-                "description": update.get("description"),
-                "reason_relevant": update.get("reason_relevant"),
-                "source_url": update.get("source_url"),
-                "priority_score": update.get("priority_score"),
-                "status": update.get("status"),
-            })
-            applied_updates.append({"action": "update", "opportunity": updated})
-        elif action == "archive":
-            opportunity_id = update.get("opportunity_id")
-            if opportunity_id is None:
-                continue
-            archived = opportunity_service.archive_opportunity(int(opportunity_id))
-            applied_updates.append({"action": "archive", "opportunity": archived})
-        elif action == "reprioritize":
-            opportunity_id = update.get("opportunity_id")
+            existing = dict(existing)
             priority_score = update.get("priority_score")
-            if opportunity_id is None or priority_score is None:
-                continue
-            updated = opportunity_service.update_priority(int(opportunity_id), int(priority_score))
-            applied_updates.append({"action": "reprioritize", "opportunity": updated})
+            if priority_score is None and priority_signal:
+                existing_priority = int(existing.get("priority_score") or 5)
+                priority_score = max(1, min(10, existing_priority + priority_signal))
+            if action == "archive":
+                archived = opportunity_service.archive_opportunity(int(existing["id"]))
+                applied_updates.append({"action": "archive", "opportunity": archived})
+            elif action == "reprioritize":
+                if priority_score is None:
+                    continue
+                updated = opportunity_service.update_priority(int(existing["id"]), normalize_priority_score(priority_score))
+                applied_updates.append({"action": "reprioritize", "opportunity": updated})
+            else:
+                clause = dict(update)
+                if priority_score is not None:
+                    clause["priority_score"] = priority_score
+                updated = merge_opportunity_update(opportunity_service, existing, clause, payload.session_id)
+                applied_updates.append({"action": "update", "opportunity": updated, "matched": True})
 
     return {
         "assistant_response": assistant_text,
