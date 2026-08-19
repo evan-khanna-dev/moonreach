@@ -4,3 +4,5 @@ anthropic==0.120.2
 supabase==2.31.0
 httpx==0.28.1
 python-dotenv==1.2.1
+python-multipart==0.0.20
+docling==2.15.1

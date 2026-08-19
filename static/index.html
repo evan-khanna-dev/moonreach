@@ -8,12 +8,21 @@
 </head>
 <body>
   <main class="app-shell">
-    <aside class="sidebar card">
-      <div class="sidebar-header">
-        <h2>Sessions</h2>
-        <button id="new-session-button" type="button">+ New</button>
+    <aside class="sidebar">
+      <div class="card">
+        <div class="sidebar-header">
+          <h2>Profile</h2>
+          <button id="edit-profile-button" type="button" class="hidden">Edit</button>
+        </div>
+        <div id="profile-card" class="profile-card"></div>
       </div>
-      <div id="session-list" class="session-list"></div>
+      <div id="chats-card" class="card hidden">
+        <div class="sidebar-header">
+          <h2>Chats</h2>
+          <button id="new-session-button" type="button">+ New</button>
+        </div>
+        <div id="session-list" class="session-list"></div>
+      </div>
     </aside>
 
     <div class="content-stack">
@@ -25,78 +34,66 @@
       </section>
 
       <section id="onboarding" class="card">
-        <h2>Start your workspace</h2>
+        <h2>Welcome — let's set up your profile</h2>
+        <p class="note">This is asked once. University, major, and year are remembered for every chat you start afterward — you can edit them any time.</p>
         <form id="onboarding-form">
           <label>
             University
-            <input id="university" type="text" placeholder="e.g. University of Michigan" required />
+            <input id="onboarding-university" type="text" placeholder="e.g. University of Michigan" required />
           </label>
           <label>
             Major
-            <input id="major" type="text" placeholder="e.g. Computer Science" required />
+            <input id="onboarding-major" type="text" placeholder="e.g. Computer Science" required />
           </label>
           <label>
             Year / Standing
-            <input id="year" type="text" placeholder="e.g. Junior" required />
+            <input id="onboarding-year" type="text" placeholder="e.g. Junior" required />
           </label>
-          <label>
-            Career goals
-            <textarea id="goals" placeholder="Describe your goals, e.g. internships, networking, job search" required></textarea>
-          </label>
-          <button type="submit">Create workspace</button>
+          <button type="submit">Create my profile</button>
         </form>
+      </section>
+
+      <section id="empty-chat-state" class="card hidden">
+        <h2>Start your first chat</h2>
+        <p class="note">Each chat is its own pursuit — internships, grad school, networking, whatever you're focused on right now.</p>
+        <button id="empty-state-new-chat" type="button">Start a chat</button>
       </section>
 
       <section id="workspace-container" class="hidden">
         <div class="session-info card">
           <div>
-            <p class="section-label">Active workspace</p>
-            <h2 id="session-id">—</h2>
+            <p class="section-label">This chat is about</p>
+            <h2 id="chat-goal">—</h2>
           </div>
-          <button id="reset-session" type="button">New workspace</button>
         </div>
 
-        <div id="session-context" class="card session-context hidden"></div>
+        <!-- App Top Navigation Tabs -->
+        <nav class="app-nav">
+          <button class="nav-tab active" data-page="northstar-page" type="button">🧭 North Star</button>
+          <button class="nav-tab" data-page="chat-page" type="button">💬 Coach & Chat</button>
+          <button class="nav-tab" data-page="radar-page" type="button">📡 Career Radar</button>
+          <button class="nav-tab" data-page="plan-page" type="button">📋 Action Plan</button>
+          <button class="nav-tab" data-page="appointments-page" type="button">📅 Appointments</button>
+        </nav>
 
-        <section class="card northstar-panel">
+        <!-- PAGE 1: Dedicated App-Wide North Star Page -->
+        <section id="northstar-page" class="app-page card northstar-panel">
           <div class="panel-header">
             <div>
-              <p class="section-label">North Star</p>
-              <h2>What should you focus on right now?</h2>
+              <p class="section-label">App North Star</p>
+              <h2>Your Strategic Direction & Priorities</h2>
+              <p id="northstar-updated" class="northstar-updated"></p>
             </div>
-            <button id="refresh-northstar" type="button">Refresh</button>
+            <button id="refresh-northstar" type="button">🔄 Refresh Analysis</button>
           </div>
+          <div id="northstar-whats-new" class="northstar-whats-new hidden"></div>
           <div id="northstar-output" class="northstar-output">
             <div class="radar-empty">Analyzing your profile and career radar to find your current direction...</div>
           </div>
         </section>
 
-        <div class="workspace-grid">
-          <section class="card radar-panel">
-            <div class="panel-header">
-              <div>
-                <p class="section-label">Career Radar</p>
-                <h2>Persistent opportunities</h2>
-              </div>
-            </div>
-            <div id="radar-list" class="radar-list"></div>
-          </section>
-
-          <section class="card plan-panel">
-            <div class="panel-header">
-              <div>
-                <p class="section-label">Career Plan</p>
-                <h2>Action items</h2>
-              </div>
-              <button id="generate-plan" type="button">Generate plan</button>
-            </div>
-            <div id="plan-output" class="plan-output hidden">
-              <ol id="plan-list"></ol>
-            </div>
-          </section>
-        </div>
-
-        <section class="card chat-panel">
+        <!-- PAGE 2: Coach & Chat Page -->
+        <section id="chat-page" class="app-page card chat-panel hidden">
           <div class="panel-header">
             <div>
               <p class="section-label">Coach</p>
@@ -112,9 +109,165 @@
             </div>
           </div>
         </section>
+
+        <!-- PAGE 3: Career Radar Page -->
+        <section id="radar-page" class="app-page card radar-panel hidden">
+          <div class="panel-header">
+            <div>
+              <p class="section-label">Career Radar</p>
+              <h2>Persistent opportunities</h2>
+            </div>
+          </div>
+          <div id="radar-list" class="radar-list"></div>
+        </section>
+
+        <!-- PAGE 4: Action Plan Page -->
+        <section id="plan-page" class="app-page card plan-panel hidden">
+          <div class="panel-header">
+            <div>
+              <p class="section-label">Career Plan</p>
+              <h2>Action items</h2>
+            </div>
+            <button id="generate-plan" type="button">Generate plan</button>
+          </div>
+          <div id="plan-output" class="plan-output">
+            <ol id="plan-list"></ol>
+          </div>
+        </section>
+
+        <!-- PAGE 5: Appointments -->
+        <section id="appointments-page" class="app-page card appointments-panel hidden">
+          <div class="panel-header">
+            <div>
+              <p class="section-label">Appointments</p>
+              <h2>Get feedback on your documents</h2>
+            </div>
+          </div>
+
+          <!-- Menu: which document type -->
+          <div id="appointments-menu" class="appointments-menu">
+            <button type="button" id="resume-feedback-option" class="appointment-option">
+              <span class="appointment-option-title">📄 Resume Feedback</span>
+              <span class="appointment-option-desc">Upload or paste your resume for structured, grounded feedback.</span>
+            </button>
+            <div class="appointment-option disabled" aria-disabled="true">
+              <span class="appointment-option-title">📝 CV Review</span>
+              <span class="appointment-option-desc">Coming soon</span>
+            </div>
+            <div class="appointment-option disabled" aria-disabled="true">
+              <span class="appointment-option-title">✉️ Cover Letter Feedback</span>
+              <span class="appointment-option-desc">Coming soon</span>
+            </div>
+            <div class="appointment-option disabled" aria-disabled="true">
+              <span class="appointment-option-title">💼 LinkedIn Review</span>
+              <span class="appointment-option-desc">Coming soon</span>
+            </div>
+          </div>
+
+          <!-- Resume feedback flow -->
+          <div id="resume-feedback-flow" class="hidden">
+            <button type="button" id="resume-flow-back" class="secondary-button appointments-back">← Back to Appointments</button>
+
+            <div id="resume-upload-step" class="resume-step">
+              <h3>Upload or paste your resume</h3>
+              <p class="note">This tool strengthens what you've already written - it won't generate a resume for you.</p>
+              <label>
+                Upload a PDF, DOCX, or TXT file (optional)
+                <input
+                  type="file"
+                  id="resume-file-input"
+                  accept=".pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
+                />
+              </label>
+              <p id="resume-upload-status" class="note hidden"></p>
+              <label>
+                Or paste your resume text
+                <textarea id="resume-text-input" placeholder="Paste your resume text here..." rows="10"></textarea>
+              </label>
+              <button type="button" id="resume-upload-continue">Continue</button>
+            </div>
+
+            <div id="resume-intent-step" class="resume-step hidden">
+              <h3>What kind of feedback do you want?</h3>
+              <div id="resume-intent-chips" class="chips"></div>
+            </div>
+
+            <div id="resume-role-context-step" class="resume-step hidden">
+              <h3>Tell me about the role</h3>
+              <label>
+                Job title
+                <input type="text" id="resume-role-title" placeholder="e.g. Data Analyst Intern" required />
+              </label>
+              <label>
+                Company / organization (optional)
+                <input type="text" id="resume-role-company" placeholder="e.g. Acme Corp" />
+              </label>
+              <label>
+                Industry / field (optional)
+                <input type="text" id="resume-role-industry" placeholder="e.g. Fintech" />
+              </label>
+              <label>
+                Pasted job posting or link (optional)
+                <textarea id="resume-role-posting" placeholder="Paste a job posting or link here..." rows="4"></textarea>
+              </label>
+              <button type="button" id="resume-role-context-submit">Get tailored feedback</button>
+            </div>
+
+            <div id="resume-thread-step" class="resume-step hidden">
+              <div id="resume-thread" class="chat-card"></div>
+              <div class="composer">
+                <textarea id="resume-followup-input" placeholder="Ask a follow-up, e.g. 'rewrite this bullet' or 'what about my education section'"></textarea>
+                <div class="composer-actions">
+                  <button type="button" id="resume-followup-send">Send</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
       </section>
     </div>
   </main>
+
+  <div id="new-chat-modal" class="modal-overlay hidden">
+    <div class="card modal-card">
+      <h2>What's this chat about?</h2>
+      <p class="note">University, major, and year are already known from your profile — just describe this pursuit.</p>
+      <form id="new-chat-form">
+        <label>
+          Goal for this chat
+          <textarea id="new-chat-goals" placeholder="e.g. Landing a summer internship in data science" required></textarea>
+        </label>
+        <div class="composer-actions">
+          <button type="submit">Start chat</button>
+          <button type="button" id="new-chat-cancel" class="secondary-button">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="edit-profile-modal" class="modal-overlay hidden">
+    <div class="card modal-card">
+      <h2>Edit profile</h2>
+      <form id="edit-profile-form">
+        <label>
+          University
+          <input id="edit-profile-university" type="text" required />
+        </label>
+        <label>
+          Major
+          <input id="edit-profile-major" type="text" required />
+        </label>
+        <label>
+          Year / Standing
+          <input id="edit-profile-year" type="text" required />
+        </label>
+        <div class="composer-actions">
+          <button type="submit">Save</button>
+          <button type="button" id="edit-profile-cancel" class="secondary-button">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

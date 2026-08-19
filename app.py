@@ -1,4 +1,5 @@
 import difflib
+import io
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ from urllib.parse import quote_plus
 import httpx
 from anthropic import AI_PROMPT, Anthropic, HUMAN_PROMPT
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -110,11 +111,45 @@ HEADERS = {
     )
 }
 
+# Appointments: document reviews. Resume only for this pass - CV, cover
+# letter, and LinkedIn intentionally not built yet (see DocumentReviewCreate).
+SUPPORTED_DOCUMENT_TYPES = {"resume"}
+RESUME_REVIEW_INTENTS = {"general_feedback", "tailor_to_role", "something_else"}
+RESUME_FOLLOWUP_INTENT = "resume_follow_up"
+RESUME_GROUNDING_DOCUMENT_PATH = os.path.join(os.path.dirname(__file__), "resume-grounding-document.md")
 
-class SessionCreate(BaseModel):
+# Resume upload: which formats we accept and extract text from before any of
+# the review logic above ever sees the document (see extract_resume_text).
+SUPPORTED_RESUME_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".txt"}
+# MIME type is a secondary signal, not the sole gate - browsers/OSes are
+# inconsistent about what they send. A generic/missing content-type is
+# tolerated; an outright mismatch (e.g. .txt extension, application/pdf
+# content-type) is rejected.
+RESUME_UPLOAD_MIME_TYPES_BY_EXTENSION = {
+    ".pdf": {"application/pdf"},
+    ".docx": {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/zip",  # some browsers/OSes report the underlying zip container
+    },
+    ".txt": {"text/plain"},
+}
+GENERIC_UPLOAD_MIME_TYPES = {"application/octet-stream", ""}
+MAX_RESUME_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB - no existing app-wide upload limit to match, chosen fresh
+
+
+class ProfileCreate(BaseModel):
     university: str
     major: str
     year: str
+
+
+class ProfileUpdate(BaseModel):
+    university: Optional[str] = None
+    major: Optional[str] = None
+    year: Optional[str] = None
+
+
+class SessionCreate(BaseModel):
     goals: str
 
 
@@ -127,8 +162,13 @@ class PlanRequest(BaseModel):
     session_id: int
 
 
-class NorthStarRequest(BaseModel):
+class DocumentReviewCreate(BaseModel):
     session_id: int
+    document_type: str = "resume"
+    document_content: str
+    intent: str
+    role_context: Optional[Dict[str, Any]] = None
+    message: Optional[str] = None
 
 
 class OpportunityCreate(BaseModel):
@@ -328,13 +368,7 @@ class OpportunityService:
             "created_at": self._now(),
             "updated_at": self._now(),
         }
-        try:
-            print("INSERT PAYLOAD", insert_payload)
-            response = self.table.insert(insert_payload).select("*").execute()
-        except Exception as exc:
-            print("SUPABASE ERROR:", exc)
-
-        print("RAW RESPONSE", response)
+        response = execute_db(self.table.insert(insert_payload).select("*"))
         if not getattr(response, "data", None):
             raise HTTPException(status_code=500, detail="Failed to create opportunity")
         return response.data[0]
@@ -633,16 +667,46 @@ def parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
     if not isinstance(parsed, dict):
         return None
 
-    if isinstance(parsed.get("assistant_response"), str):
+    # Claude occasionally wraps its own JSON schema inside the
+    # assistant_response string (sometimes more than once). Keep unwrapping
+    # until it stops nesting, so a doubly-wrapped payload can't slip through
+    # as literal JSON text in the visible response. Depth-capped so a
+    # pathological/cyclical payload can't loop forever.
+    for _ in range(5):
+        if not isinstance(parsed.get("assistant_response"), str):
+            break
         nested = try_parse(parsed["assistant_response"])
-        if isinstance(nested, dict):
-            merged = dict(parsed)
-            for key in ("assistant_response", "suggested_replies", "career_radar_updates"):
-                if key in nested:
-                    merged[key] = nested[key]
-            return merged
+        if not isinstance(nested, dict):
+            break
+        merged = dict(parsed)
+        for key in ("assistant_response", "suggested_replies", "career_radar_updates"):
+            if key in nested:
+                merged[key] = nested[key]
+        if merged == parsed:
+            break
+        parsed = merged
 
     return parsed
+
+
+def salvage_assistant_text(raw: str) -> str:
+    """Best-effort recovery when parse_json_response gives up entirely (e.g.
+    output truncated mid-JSON by max_tokens/stop_sequence, or a stray
+    preamble breaks every parse attempt). Never return the raw JSON-shaped
+    text verbatim - that's what ends up as a literal JSON blob in the chat
+    bubble and gets persisted to the messages table."""
+    text = (raw or "").strip()
+    if not text.startswith("{"):
+        # Doesn't look like the requested JSON shape at all - Claude likely
+        # just replied in prose despite the instructions. Safe to show as-is.
+        return text
+    match = re.search(r'"assistant_response"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.S)
+    if match:
+        try:
+            return json.loads(f'"{match.group(1)}"')
+        except Exception:
+            return match.group(1)
+    return "Sorry, I had trouble formatting that response - could you try rephrasing your last message?"
 
 
 def compose_coach_prompt(
@@ -753,15 +817,27 @@ def compose_plan_prompt(context: Dict[str, str], history: List[Dict[str, str]]) 
 
 def compose_north_star_prompt(
     context: Dict[str, str],
+    chats: List[Dict[str, Any]],
     opportunities: List[Dict[str, Any]],
-    history: List[Dict[str, str]],
-    plan_items: List[str],
+    history: List[Dict[str, Any]],
+    plans: List[Dict[str, Any]],
 ) -> str:
+    goals_by_id = {int(chat["id"]): str(chat.get("goals") or f"Chat {chat['id']}") for chat in chats}
+
+    chat_lines = []
+    if chats:
+        for chat in chats:
+            chat_lines.append(f"- {chat.get('goals') or 'Untitled chat'} (started {str(chat.get('created_at'))[:10]})")
+    else:
+        chat_lines.append("- (no chats started yet)")
+    chats_block = "\n".join(chat_lines)
+
     opportunity_lines = []
     if opportunities:
         for item in opportunities:
+            chat_label = goals_by_id.get(int(item.get("session_id") or -1), "Unknown chat")
             entry = (
-                f"- {item.get('title', 'Untitled')} (id={item.get('id')}) | "
+                f"- [{chat_label}] {item.get('title', 'Untitled')} (id={item.get('id')}) | "
                 f"category={item.get('category', 'Other')} | "
                 f"status={item.get('status', 'suggested')} | "
                 f"priority={item.get('priority_score', 5)}/10"
@@ -803,36 +879,44 @@ def compose_north_star_prompt(
         content = str(item.get("content") or "")
         if len(content) > 600:
             content = content[:600] + "…"
-        history_lines.append(f"{role}: {content}")
+        chat_label = item.get("chat") or "Unknown chat"
+        history_lines.append(f"[{chat_label}] {role}: {content}")
     history_block = "\n".join(history_lines) if history_lines else "- (no conversation yet)"
 
     plan_block = "- (no plan generated yet)"
-    if plan_items:
-        plan_block = "- " + "\n- ".join(plan_items)
+    if plans:
+        plan_lines = []
+        for entry in plans:
+            for item in entry.get("items", []):
+                plan_lines.append(f"[{entry.get('chat')}] {item}")
+        if plan_lines:
+            plan_block = "- " + "\n- ".join(plan_lines)
 
     prompt = (
         f"{HUMAN_PROMPT}You are the North Star engine of a student career workspace. Your single job is to answer one "
-        "question: what should this student focus on RIGHT NOW based on EVERYTHING we know about them? "
+        "question: what should this student focus on RIGHT NOW based on EVERYTHING we know about them, across ALL of "
+        "their chats? "
         "You are a synthesis engine, NOT a recommendation engine and NOT a job-title predictor. "
         "Do NOT invent opportunities, programs, degrees, employers, or facts. Everything must be grounded in the "
-        "profile, opportunities, opportunity statuses, and conversations below. "
+        "profile, chats, opportunities, opportunity statuses, and conversations below. "
         "Students are not confused about which careers exist; they are confused about what to do next. Reduce that "
         "confusion and move them forward. You are the student's career command center, not a chat summary."
         "\n\n"
-        "Student profile:\n"
+        "Student profile (identity, shared across every chat):\n"
         f"University: {context['university']}\n"
         f"Major: {context['major']}\n"
-        f"Year: {context['year']}\n"
-        f"Career goals: {context['goals']}\n\n"
-        "Career Radar - all tracked opportunities across their whole lifecycle (statuses and priorities are cumulative "
-        "history):\n"
+        f"Year: {context['year']}\n\n"
+        "This student's chats (each is a distinct pursuit/topic; use these as the student's stated goals):\n"
+        f"{chats_block}\n\n"
+        "Career Radar - all tracked opportunities across every chat and their whole lifecycle (statuses and priorities "
+        "are cumulative history):\n"
         + "\n".join(opportunity_lines)
         + "\n\n"
         "Opportunity lifecycle snapshot:\n"
         f"{lifecycle_block}\n\n"
-        "Full conversation history (every message in the session, not just the recent exchange):\n"
+        "Recent conversation history across all chats (tagged by which chat each message belongs to):\n"
         f"{history_block}\n\n"
-        "Latest action plan:\n"
+        "Latest action plan per chat:\n"
         f"{plan_block}\n\n"
         "Produce a JSON object with exactly these keys:\n"
         "- current_direction: object with direction (a broad direction label only, e.g. 'Technology', 'AI / Research', "
@@ -935,6 +1019,315 @@ def normalize_north_star(parsed: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def diff_north_star(previous: Optional[Dict[str, Any]], current: Dict[str, Any]) -> List[str]:
+    """Plain-Python comparison of two normalized North Star payloads, so the
+    "living profile" is visibly dynamic without spending another Claude call
+    just to describe its own diff."""
+    if not previous:
+        return ["Initial North Star generated."]
+
+    changes: List[str] = []
+
+    prev_direction = str((previous.get("current_direction") or {}).get("direction") or "").strip()
+    new_direction = str((current.get("current_direction") or {}).get("direction") or "").strip()
+    if prev_direction and new_direction and prev_direction != new_direction:
+        changes.append(f"Direction shifted from \"{prev_direction}\" to \"{new_direction}\".")
+
+    for key, singular in (("priorities", "priority"), ("risks", "risk"), ("upcoming_opportunities", "upcoming opportunity")):
+        prev_titles = {str(item.get("title") or "").strip().lower() for item in (previous.get(key) or [])}
+        new_titles = {str(item.get("title") or "").strip().lower() for item in (current.get(key) or [])}
+        added = new_titles - prev_titles
+        removed = prev_titles - new_titles
+        if added:
+            changes.append(f"{len(added)} new {singular}{'s' if len(added) != 1 else ''} surfaced.")
+        if removed:
+            changes.append(f"{len(removed)} {singular}{'s' if len(removed) != 1 else ''} resolved or dropped off.")
+
+    if not changes:
+        changes.append("No material change since the last analysis.")
+    return changes
+
+
+def load_resume_grounding_document() -> str:
+    """Read the curated resume best-practices document that all resume
+    feedback must be grounded in. Raises rather than falling back to any
+    built-in knowledge - feedback must be traceable to this file, not
+    fabricated when it's missing."""
+    try:
+        with open(RESUME_GROUNDING_DOCUMENT_PATH, "r", encoding="utf-8") as handle:
+            content = handle.read().strip()
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "resume-grounding-document.md was not found in the project root. "
+                "Resume feedback requires this file to be present."
+            ),
+        )
+    if not content:
+        raise HTTPException(status_code=500, detail="resume-grounding-document.md is empty.")
+    return content
+
+
+class ResumeExtractionError(Exception):
+    """A user-facing document-parsing failure: unsupported type, corrupt
+    file, empty content, or a parser error. Always safe to show str(exc) to
+    the caller - never wraps a raw internal exception message."""
+
+
+_docling_converter = None
+_docling_stream_class = None
+
+
+def _get_docling_classes():
+    """Lazily import and cache Docling's DocumentConverter instance and
+    DocumentStream class together, as the single import point for both.
+
+    Imported lazily (not at module top-level) on purpose: docling is a heavy
+    dependency, and a bad import here must only break PDF/DOCX extraction,
+    not crash the entire app at startup for every other endpoint. Doing both
+    imports here - rather than a second lazy import inside
+    _extract_text_with_docling's try/except - matters: otherwise a missing-
+    dependency ImportError gets caught by that function's generic
+    parse-failure handler and misreported as "corrupted file" instead of
+    "not installed."
+    """
+    global _docling_converter, _docling_stream_class
+    if _docling_converter is None or _docling_stream_class is None:
+        try:
+            from docling.document_converter import DocumentConverter
+            from docling.datamodel.base_models import DocumentStream
+        except ImportError as exc:
+            logger.error("Docling is not installed/importable: %s", exc)
+            raise ResumeExtractionError(
+                "PDF/DOCX parsing isn't available right now. Please try again later or paste your resume text directly."
+            )
+        _docling_converter = DocumentConverter()
+        _docling_stream_class = DocumentStream
+    return _docling_converter, _docling_stream_class
+
+
+def _extract_text_from_txt(raw_bytes: bytes) -> str:
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return raw_bytes.decode("latin-1")
+        except UnicodeDecodeError:
+            raise ResumeExtractionError(
+                "Could not read that text file. Please make sure it's a plain-text file and try again."
+            )
+
+
+def _extract_text_with_docling(raw_bytes: bytes, extension: str) -> str:
+    """PDF/DOCX -> Markdown via Docling, preserving headings/bullets/tables/
+    reading order rather than flattening to an unstructured blob. Runs
+    entirely in memory (DocumentStream over BytesIO) - no temp file is ever
+    written to disk for an untrusted upload."""
+    converter, document_stream_cls = _get_docling_classes()
+    try:
+        stream = document_stream_cls(name=f"resume{extension}", stream=io.BytesIO(raw_bytes))
+        result = converter.convert(stream)
+        markdown = result.document.export_to_markdown()
+    except ResumeExtractionError:
+        raise
+    except Exception as exc:
+        logger.warning("Docling failed to parse uploaded resume (%s): %s", extension, exc)
+        raise ResumeExtractionError(
+            "That file couldn't be read - it may be corrupted, password-protected, or in an unsupported format. "
+            "Please try a different file or paste your resume text directly."
+        )
+    return markdown
+
+
+def extract_resume_text(filename: str, content_type: Optional[str], raw_bytes: bytes) -> str:
+    """Normalize an uploaded resume (PDF/DOCX/TXT) into plain/Markdown text.
+    Everything downstream of this function (the review prompts, /document-
+    reviews) only ever sees the returned string - it never needs to know
+    which format the original file was."""
+    extension = os.path.splitext(filename or "")[1].lower()
+
+    if extension not in SUPPORTED_RESUME_UPLOAD_EXTENSIONS:
+        raise ResumeExtractionError(
+            f"Unsupported file type '{extension or 'unknown'}'. Please upload a PDF, DOCX, or TXT file."
+        )
+
+    allowed_mimes = RESUME_UPLOAD_MIME_TYPES_BY_EXTENSION.get(extension, set())
+    if content_type and content_type not in allowed_mimes and content_type not in GENERIC_UPLOAD_MIME_TYPES:
+        raise ResumeExtractionError(
+            f"That file doesn't look like a valid {extension} file. Please double-check the file and try again."
+        )
+
+    if len(raw_bytes) > MAX_RESUME_UPLOAD_BYTES:
+        raise ResumeExtractionError("That file is too large. Please upload a resume under 10 MB.")
+
+    if not raw_bytes:
+        raise ResumeExtractionError("The uploaded file is empty.")
+
+    if extension == ".txt":
+        # Simplest appropriate handling for plain text - no reason to route
+        # it through Docling's document-layout pipeline.
+        text = _extract_text_from_txt(raw_bytes)
+    else:
+        text = _extract_text_with_docling(raw_bytes, extension)
+
+    text = text.strip()
+    if not text:
+        raise ResumeExtractionError(
+            "No readable text could be extracted from that file. Please try a different file or paste your resume text directly."
+        )
+    return text
+
+
+def format_role_context(role_context: Optional[Dict[str, Any]]) -> str:
+    if not role_context:
+        return ""
+    lines = []
+    title = str(role_context.get("title") or "").strip()
+    company = str(role_context.get("company") or "").strip()
+    industry = str(role_context.get("industry") or "").strip()
+    job_posting = str(role_context.get("job_posting") or "").strip()
+    if title:
+        lines.append(f"Target role: {title}")
+    if company:
+        lines.append(f"Company/organization: {company}")
+    if industry:
+        lines.append(f"Industry/field: {industry}")
+    if job_posting:
+        lines.append(f"Pasted job posting / link (context only, not browsed):\n{job_posting}")
+    return "\n".join(lines)
+
+
+def build_role_search_query(role_context: Optional[Dict[str, Any]]) -> str:
+    if not role_context:
+        return "resume expectations and norms"
+    parts = [
+        str(role_context.get("title") or "").strip(),
+        str(role_context.get("company") or "").strip(),
+        str(role_context.get("industry") or "").strip(),
+        "resume expectations qualifications norms",
+    ]
+    return " ".join(part for part in parts if part)
+
+
+def compose_resume_review_prompt(
+    grounding_doc: str,
+    resume_text: str,
+    intent: str,
+    role_context: Optional[Dict[str, Any]],
+    search_summary: Optional[str],
+) -> str:
+    role_block = format_role_context(role_context)
+    search_block = (
+        f"\nLive search results on role/company expectations:\n{search_summary}\n"
+        if search_summary
+        else ""
+    )
+    role_alignment_instruction = (
+        "\n- role_alignment: a dedicated \"How this aligns with "
+        f"{(role_context or {}).get('title') or 'the target role'}\" section combining the grounding "
+        "document's baseline principles with the live search results above. Ground every claim in "
+        "either the document or the search results - never invent role expectations."
+        if intent == "tailor_to_role"
+        else ""
+    )
+
+    prompt = (
+        f"{HUMAN_PROMPT}You are a resume feedback assistant for college students. Your ONLY job is to "
+        "strengthen a resume the student has ALREADY WRITTEN. You never author a resume from scratch, "
+        "never invent a full section or bullet the student didn't write, and never produce a complete "
+        "replacement resume - only feedback on what's there.\n\n"
+        "CRITICAL GROUNDING RULE: base your feedback ONLY on the principles in the grounding document "
+        "below. Do not draw on general internet knowledge of resume writing beyond what this document "
+        "states. Where a suggestion reflects a specific principle from the document, briefly say which "
+        "one (e.g. \"per the document's guidance on quantifying impact\") so the feedback is traceable, "
+        "not just asserted.\n\n"
+        "Grounding document (resume-grounding-document.md, full contents):\n"
+        "-----\n"
+        f"{grounding_doc}\n"
+        "-----\n\n"
+        "Student's resume (verbatim, as submitted):\n"
+        "-----\n"
+        f"{resume_text}\n"
+        "-----\n\n"
+        f"{f'Role context:{chr(10)}{role_block}{chr(10)}{chr(10)}' if role_block else ''}"
+        f"{search_block}"
+        "Produce a JSON object with exactly these keys:\n"
+        "- strengths: array of short strings, specific things the resume already does well\n"
+        "- areas_to_improve: array of short strings, concrete gaps grounded in the document\n"
+        "- line_suggestions: array of short strings, each a specific line/bullet-level rewrite "
+        "suggestion (quote or reference the original line)\n"
+        "- overall_summary: 2-3 sentence summary\n"
+        f"{role_alignment_instruction}\n"
+        "Do not add any additional text outside the JSON object."
+        f"{AI_PROMPT}"
+    )
+    return prompt
+
+
+def compose_resume_followup_prompt(
+    grounding_doc: str,
+    resume_text: str,
+    role_context: Optional[Dict[str, Any]],
+    thread_so_far: List[Dict[str, Any]],
+    user_message: str,
+) -> str:
+    role_block = format_role_context(role_context)
+    thread_lines = []
+    for row in thread_so_far:
+        feedback = row.get("ai_feedback") or {}
+        if row.get("intent") == RESUME_FOLLOWUP_INTENT:
+            thread_lines.append(f"Student: {feedback.get('user_message', '')}")
+            thread_lines.append(f"You: {feedback.get('assistant_response', '')}")
+        else:
+            thread_lines.append(
+                "You (initial review): "
+                f"strengths={feedback.get('strengths')}; areas_to_improve={feedback.get('areas_to_improve')}; "
+                f"line_suggestions={feedback.get('line_suggestions')}; summary={feedback.get('overall_summary')}"
+            )
+    thread_block = "\n".join(thread_lines) if thread_lines else "(no prior turns)"
+
+    prompt = (
+        f"{HUMAN_PROMPT}You are continuing a resume feedback conversation. Same rules as before: you "
+        "strengthen what the student already wrote, you never author new resume content from scratch, "
+        "and your feedback must stay grounded only in the document below, not general knowledge.\n\n"
+        "Grounding document (resume-grounding-document.md, full contents):\n"
+        "-----\n"
+        f"{grounding_doc}\n"
+        "-----\n\n"
+        "Student's resume (verbatim):\n"
+        "-----\n"
+        f"{resume_text}\n"
+        "-----\n\n"
+        f"{f'Role context:{chr(10)}{role_block}{chr(10)}{chr(10)}' if role_block else ''}"
+        "Conversation so far:\n"
+        f"{thread_block}\n\n"
+        f"Student's new message: {user_message}\n\n"
+        "Produce a JSON object with exactly one key, assistant_response, containing your reply. "
+        "Do not add any additional text outside the JSON object."
+        f"{AI_PROMPT}"
+    )
+    return prompt
+
+
+def _string_list(raw: Any, limit: int = 8) -> List[str]:
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()][:limit]
+
+
+def normalize_resume_review(parsed: Optional[Dict[str, Any]], intent: str) -> Dict[str, Any]:
+    if not isinstance(parsed, dict):
+        return {"strengths": [], "areas_to_improve": [], "line_suggestions": [], "overall_summary": "", "role_alignment": ""}
+    return {
+        "strengths": _string_list(parsed.get("strengths")),
+        "areas_to_improve": _string_list(parsed.get("areas_to_improve")),
+        "line_suggestions": _string_list(parsed.get("line_suggestions")),
+        "overall_summary": str(parsed.get("overall_summary") or "").strip(),
+        "role_alignment": str(parsed.get("role_alignment") or "").strip() if intent == "tailor_to_role" else "",
+    }
+
+
 # def call_claude(prompt: str, max_tokens: int = 900, temperature: float = 0.7) -> str:
 #     response = anthropic.completions.create(
 #         model=ANTHROPIC_MODEL,
@@ -962,15 +1355,49 @@ def call_claude(prompt: str, max_tokens: int = 2000, temperature: float = 0.7) -
             assistant_text += getattr(block, "text", "") or ""
     return assistant_text.strip()
 
+def get_profile_by_device(device_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not device_id:
+        return None
+    response = execute_db(
+        db_table("profiles")
+        .select("id, university, major, year, created_at, updated_at")
+        .eq("device_id", device_id)
+    )
+    data = getattr(response, "data", None) or []
+    return data[0] if data else None
+
+
+def require_profile(device_id: Optional[str]) -> Dict[str, Any]:
+    profile = get_profile_by_device(device_id)
+    if not profile:
+        raise HTTPException(
+            status_code=404,
+            detail="No profile found for this device. Complete onboarding first.",
+        )
+    return profile
+
+
 def get_session(session_id: int) -> Dict[str, str]:
+    """Return a chat's context, joining the profile it belongs to for
+    university/major/year (the single source of truth for identity fields).
+    `goals` remains this chat's own per-chat topic.
+    """
     response = execute_db(
         db_table("sessions")
-        .select("id, university, major, year, goals")
+        .select("id, goals, created_at, profile_id, profiles(university, major, year)")
         .eq("id", session_id)
     )
     if not getattr(response, "data", None):
         raise HTTPException(status_code=404, detail="Session not found")
-    return response.data[0]
+    row = response.data[0]
+    profile = row.get("profiles") or {}
+    return {
+        "id": row["id"],
+        "goals": row.get("goals") or "",
+        "university": profile.get("university") or "",
+        "major": profile.get("major") or "",
+        "year": profile.get("year") or "",
+    }
 
 
 def get_message_history(session_id: int) -> List[Dict[str, str]]:
@@ -1010,11 +1437,145 @@ def get_latest_plan(session_id: int) -> List[str]:
     return normalize_plan_items(response.data[0].get("plan_items"))
 
 
-@app.get("/sessions")
-async def list_sessions() -> Dict[str, Any]:
+def get_profile_chats(profile_id: int) -> List[Dict[str, Any]]:
     response = execute_db(
         db_table("sessions")
-        .select("id, university, major, year, goals, created_at")
+        .select("id, goals, created_at")
+        .eq("profile_id", profile_id)
+        .order("created_at", desc=False)
+    )
+    return getattr(response, "data", None) or []
+
+
+def get_profile_opportunities(chat_ids: List[int]) -> List[Dict[str, Any]]:
+    if not chat_ids:
+        return []
+    response = execute_db(
+        db_table("opportunities")
+        .select("*")
+        .in_("session_id", chat_ids)
+        .order("priority_score", desc=True)
+        .order("updated_at", desc=True)
+    )
+    return getattr(response, "data", None) or []
+
+
+def get_profile_history(chat_ids: List[int], goals_by_id: Dict[int, str], limit_per_chat: int = 30) -> List[Dict[str, Any]]:
+    """Return recent messages across all of a profile's chats, each tagged
+    with the chat's goal so the North Star prompt can attribute evidence to
+    the right pursuit."""
+    tagged: List[Dict[str, Any]] = []
+    for chat_id in chat_ids:
+        response = execute_db(
+            db_table("messages")
+            .select("role, content, created_at")
+            .eq("session_id", chat_id)
+            .order("created_at", desc=True)
+            .limit(limit_per_chat)
+        )
+        rows = list(reversed(getattr(response, "data", None) or []))
+        chat_label = goals_by_id.get(chat_id) or f"Chat {chat_id}"
+        for row in rows:
+            tagged.append({"chat": chat_label, "role": row.get("role"), "content": row.get("content")})
+    return tagged
+
+
+def get_profile_plans(chat_ids: List[int], goals_by_id: Dict[int, str]) -> List[Dict[str, Any]]:
+    plans: List[Dict[str, Any]] = []
+    for chat_id in chat_ids:
+        items = get_latest_plan(chat_id)
+        if items:
+            plans.append({"chat": goals_by_id.get(chat_id) or f"Chat {chat_id}", "items": items})
+    return plans
+
+
+def get_session_document_reviews(session_id: int) -> List[Dict[str, Any]]:
+    response = execute_db(
+        db_table("document_reviews")
+        .select("*")
+        .eq("session_id", session_id)
+        .order("created_at", desc=False)
+    )
+    return getattr(response, "data", None) or []
+
+
+def get_document_review_thread(session_id: int, document_content: str) -> List[Dict[str, Any]]:
+    """Rows in the same chat with matching document_content form one review
+    thread (the initial review plus every follow-up on that same resume).
+    There's no parent/thread-id column in document_reviews by design, so this
+    is how a thread is reconstructed."""
+    response = execute_db(
+        db_table("document_reviews")
+        .select("*")
+        .eq("session_id", session_id)
+        .eq("document_content", document_content)
+        .order("created_at", desc=False)
+    )
+    return getattr(response, "data", None) or []
+
+
+@app.post("/profile")
+async def create_profile(
+    payload: ProfileCreate, x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+) -> Dict[str, Any]:
+    if not x_device_id:
+        raise HTTPException(status_code=400, detail="X-Device-Id header is required")
+
+    existing = get_profile_by_device(x_device_id)
+    if existing:
+        return {"profile": existing}
+
+    response = execute_db(
+        db_table("profiles")
+        .insert(
+            {
+                "university": payload.university.strip(),
+                "major": payload.major.strip(),
+                "year": payload.year.strip(),
+                "device_id": x_device_id,
+            }
+        )
+        .select("id, university, major, year, created_at, updated_at")
+    )
+    if not getattr(response, "data", None):
+        raise HTTPException(status_code=500, detail="Failed to create profile")
+    return {"profile": response.data[0]}
+
+
+@app.get("/profile")
+async def read_profile(x_device_id: Optional[str] = Header(None, alias="X-Device-Id")) -> Dict[str, Any]:
+    return {"profile": require_profile(x_device_id)}
+
+
+@app.patch("/profile")
+async def update_profile(
+    payload: ProfileUpdate, x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+) -> Dict[str, Any]:
+    profile = require_profile(x_device_id)
+    updates = {k: v.strip() for k, v in payload.dict(exclude_none=True).items()}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No update fields provided")
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    response = execute_db(
+        db_table("profiles")
+        .update(updates)
+        .eq("id", profile["id"])
+        .select("id, university, major, year, created_at, updated_at")
+    )
+    if not getattr(response, "data", None):
+        raise HTTPException(status_code=500, detail="Failed to update profile")
+    return {"profile": response.data[0]}
+
+
+@app.get("/sessions")
+async def list_sessions(x_device_id: Optional[str] = Header(None, alias="X-Device-Id")) -> Dict[str, Any]:
+    profile = get_profile_by_device(x_device_id)
+    if not profile:
+        return {"sessions": []}
+    response = execute_db(
+        db_table("sessions")
+        .select("id, goals, created_at")
+        .eq("profile_id", profile["id"])
         .order("created_at", desc=True)
     )
     sessions = getattr(response, "data", None) or []
@@ -1022,17 +1583,17 @@ async def list_sessions() -> Dict[str, Any]:
 
 
 @app.post("/session")
-async def create_session(session: SessionCreate) -> Dict[str, int]:
+async def create_session(
+    session: SessionCreate, x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+) -> Dict[str, int]:
+    profile = require_profile(x_device_id)
+    goals = session.goals.strip()
+    if not goals:
+        raise HTTPException(status_code=400, detail="goals is required")
+
     response = execute_db(
         db_table("sessions")
-        .insert(
-            {
-                "university": session.university.strip(),
-                "major": session.major.strip(),
-                "year": session.year.strip(),
-                "goals": session.goals.strip(),
-            }
-        )
+        .insert({"profile_id": profile["id"], "goals": goals})
         .select("id")
     )
 
@@ -1081,7 +1642,7 @@ async def chat(payload: ChatRequest) -> Dict[str, Any]:
             raw_output,
         )
         parsed = {
-            "assistant_response": raw_output.strip(),
+            "assistant_response": salvage_assistant_text(raw_output),
             "suggested_replies": [
                 "Tell me more about relevant campus opportunities.",
                 "How can I approach employers in my field?",
@@ -1111,6 +1672,18 @@ async def chat(payload: ChatRequest) -> Dict[str, Any]:
     if not getattr(save_response, "data", None):
         raise HTTPException(status_code=500, detail="Failed to save assistant response")
 
+    def _remember(opportunity: Dict[str, Any]) -> None:
+        """Keep existing_opportunities current as clauses are applied so a
+        later clause in the SAME Claude response (e.g. "add X" followed by
+        "update X") resolves against the row just written instead of the
+        stale snapshot fetched at the top of the request."""
+        opp_id = opportunity.get("id")
+        for index, existing_item in enumerate(existing_opportunities):
+            if existing_item.get("id") == opp_id:
+                existing_opportunities[index] = opportunity
+                return
+        existing_opportunities.append(opportunity)
+
     applied_updates = []
     priority_signal = detect_priority_signal(user_text)
     for update in parsed.get("career_radar_updates", []):
@@ -1130,6 +1703,7 @@ async def chat(payload: ChatRequest) -> Dict[str, Any]:
             )
             if existing:
                 updated = merge_opportunity_update(opportunity_service, existing, update, payload.session_id)
+                _remember(updated)
                 applied_updates.append({"action": "update", "opportunity": updated, "matched": True})
                 continue
             created = opportunity_service.create_opportunity(payload.session_id, {
@@ -1141,6 +1715,7 @@ async def chat(payload: ChatRequest) -> Dict[str, Any]:
                 "priority_score": update.get("priority_score") or 5 + max(priority_signal, 0),
                 "status": update.get("status") or "suggested",
             })
+            _remember(created)
             applied_updates.append({"action": "add", "opportunity": created})
         elif action in {"update", "reprioritize", "archive"}:
             existing = resolve_opportunity_target(opportunity_service, existing_opportunities, update, payload.session_id)
@@ -1154,17 +1729,20 @@ async def chat(payload: ChatRequest) -> Dict[str, Any]:
                 priority_score = max(1, min(10, existing_priority + priority_signal))
             if action == "archive":
                 archived = opportunity_service.archive_opportunity(int(existing["id"]))
+                _remember(archived)
                 applied_updates.append({"action": "archive", "opportunity": archived})
             elif action == "reprioritize":
                 if priority_score is None:
                     continue
                 updated = opportunity_service.update_priority(int(existing["id"]), normalize_priority_score(priority_score))
+                _remember(updated)
                 applied_updates.append({"action": "reprioritize", "opportunity": updated})
             else:
                 clause = dict(update)
                 if priority_score is not None:
                     clause["priority_score"] = priority_score
                 updated = merge_opportunity_update(opportunity_service, existing, clause, payload.session_id)
+                _remember(updated)
                 applied_updates.append({"action": "update", "opportunity": updated, "matched": True})
 
     return {
@@ -1207,25 +1785,53 @@ async def generate_plan(payload: PlanRequest) -> Dict[str, Any]:
     return {"plan": plan_json}
 
 
+def get_latest_north_star_snapshot(profile_id: int) -> Optional[Dict[str, Any]]:
+    response = execute_db(
+        db_table("north_star_snapshots")
+        .select("payload, created_at")
+        .eq("profile_id", profile_id)
+        .order("created_at", desc=True)
+        .limit(1)
+    )
+    data = getattr(response, "data", None) or []
+    return data[0] if data else None
+
+
+def save_north_star_snapshot(profile_id: int, payload: Dict[str, Any]) -> None:
+    execute_db(db_table("north_star_snapshots").insert({"profile_id": profile_id, "payload": payload}))
+
+
 @app.post("/north-star")
-async def generate_north_star(payload: NorthStarRequest) -> Dict[str, Any]:
-    session = get_session(payload.session_id)
-    opportunity_service = OpportunityService()
-    opportunities = opportunity_service.get_session_opportunities(payload.session_id)
-    history = get_message_history(payload.session_id)
-    plan_items = get_latest_plan(payload.session_id)
+async def generate_north_star(x_device_id: Optional[str] = Header(None, alias="X-Device-Id")) -> Dict[str, Any]:
+    """Cross-chat synthesis for the caller's profile. Always computed fresh -
+    there is no cache to go stale here (see HISTORY / PRD notes on the prior
+    in-memory cache bug); each run is persisted to north_star_snapshots so we
+    can show when it last changed and what changed."""
+    profile = require_profile(x_device_id)
+    profile_context = {
+        "university": profile.get("university") or "",
+        "major": profile.get("major") or "",
+        "year": profile.get("year") or "",
+    }
+
+    chats = get_profile_chats(profile["id"])
+    chat_ids = [int(chat["id"]) for chat in chats]
+    goals_by_id = {int(chat["id"]): str(chat.get("goals") or "") for chat in chats}
+    opportunities = get_profile_opportunities(chat_ids)
+    history = get_profile_history(chat_ids, goals_by_id)
+    plans = get_profile_plans(chat_ids, goals_by_id)
 
     has_evidence = bool(
-        ((session.get("university") or "").strip())
-        or ((session.get("major") or "").strip())
-        or ((session.get("year") or "").strip())
-        or ((session.get("goals") or "").strip())
+        profile_context["university"].strip()
+        or profile_context["major"].strip()
+        or profile_context["year"].strip()
+        or chats
         or opportunities
         or history
-        or plan_items
+        or plans
     )
 
-    prompt = compose_north_star_prompt(session, opportunities, history, plan_items)
+    prompt = compose_north_star_prompt(profile_context, chats, opportunities, history, plans)
 
     def synthesize(max_tokens: int) -> Optional[Dict[str, Any]]:
         raw_output = call_claude(prompt, max_tokens=max_tokens)
@@ -1244,7 +1850,20 @@ async def generate_north_star(payload: NorthStarRequest) -> Dict[str, Any]:
             logger.warning("North Star retry also failed to parse")
     result = normalize_north_star(parsed)
     result["has_evidence"] = has_evidence
+
+    if not has_evidence:
+        result["whats_new"] = []
+        result["generated_at"] = None
+        return result
+
+    previous_snapshot = get_latest_north_star_snapshot(profile["id"])
+    previous_payload = previous_snapshot.get("payload") if previous_snapshot else None
+    result["whats_new"] = diff_north_star(previous_payload, result)
+    result["generated_at"] = datetime.now(timezone.utc).isoformat()
+
+    save_north_star_snapshot(profile["id"], result)
     return result
+
 
 
 @app.post("/opportunities")
@@ -1289,6 +1908,101 @@ async def session_history(session_id: int) -> Dict[str, Any]:
     messages = get_message_history(session_id)
     plan = get_latest_plan(session_id)
     return {"session": session, "messages": messages, "plan": plan}
+
+
+@app.post("/resume-upload")
+async def upload_resume(
+    file: UploadFile = File(...), x_device_id: Optional[str] = Header(None, alias="X-Device-Id")
+) -> Dict[str, Any]:
+    """Extract plain/Markdown text from an uploaded PDF, DOCX, or TXT resume
+    (see extract_resume_text). Purely a transformation - nothing is written
+    to Supabase here; the returned text is what the client then sends to
+    /document-reviews exactly as if it had been pasted directly, so the rest
+    of the review pipeline never needs to know the original file format."""
+    require_profile(x_device_id)
+    raw_bytes = await file.read()
+    try:
+        text = extract_resume_text(file.filename or "", file.content_type, raw_bytes)
+    except ResumeExtractionError as exc:
+        logger.warning(
+            "Resume upload rejected: filename=%r content_type=%r size=%s reason=%s",
+            file.filename, file.content_type, len(raw_bytes), exc,
+        )
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"document_content": text}
+
+
+@app.post("/document-reviews")
+async def create_document_review(payload: DocumentReviewCreate) -> Dict[str, Any]:
+    """Appointments: resume feedback (CV/cover letter/LinkedIn not built yet -
+    see SUPPORTED_DOCUMENT_TYPES). Deliberately writes only to
+    document_reviews - never to messages, opportunities, or
+    north_star_snapshots, so reviews never leak into the Career Radar or
+    North Star."""
+    get_session(payload.session_id)
+
+    if payload.document_type not in SUPPORTED_DOCUMENT_TYPES:
+        raise HTTPException(status_code=400, detail="Only resume reviews are supported currently.")
+
+    document_content = payload.document_content.strip()
+    if not document_content:
+        raise HTTPException(status_code=400, detail="document_content is required")
+
+    grounding_doc = load_resume_grounding_document()
+
+    if payload.intent == RESUME_FOLLOWUP_INTENT:
+        message = (payload.message or "").strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="message is required for a follow-up turn")
+        thread = get_document_review_thread(payload.session_id, document_content)
+        prompt = compose_resume_followup_prompt(
+            grounding_doc, document_content, payload.role_context, thread, message
+        )
+        raw_output = call_claude(prompt, max_tokens=1200)
+        parsed = parse_json_response(raw_output)
+        if parsed and isinstance(parsed.get("assistant_response"), str):
+            assistant_response = parsed["assistant_response"].strip()
+        else:
+            assistant_response = salvage_assistant_text(raw_output)
+        ai_feedback = {"user_message": message, "assistant_response": assistant_response}
+        intent = RESUME_FOLLOWUP_INTENT
+    elif payload.intent in RESUME_REVIEW_INTENTS:
+        search_summary = None
+        if payload.intent == "tailor_to_role":
+            # Unlike the main coach's keyword-triggered search, this branch
+            # always wants live results - that's the whole point of it.
+            query = build_role_search_query(payload.role_context)
+            results = run_web_search(query)
+            if results:
+                search_summary = format_search_summary(query, results)
+        prompt = compose_resume_review_prompt(
+            grounding_doc, document_content, payload.intent, payload.role_context, search_summary
+        )
+        raw_output = call_claude(prompt, max_tokens=2000)
+        parsed = parse_json_response(raw_output)
+        ai_feedback = normalize_resume_review(parsed, payload.intent)
+        intent = payload.intent
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported intent: {payload.intent}")
+
+    insert_payload = {
+        "session_id": payload.session_id,
+        "document_type": payload.document_type,
+        "document_content": document_content,
+        "intent": intent,
+        "role_context": payload.role_context,
+        "ai_feedback": ai_feedback,
+    }
+    response = execute_db(db_table("document_reviews").insert(insert_payload).select("*"))
+    if not getattr(response, "data", None):
+        raise HTTPException(status_code=500, detail="Failed to save document review")
+    return {"review": response.data[0]}
+
+
+@app.get("/document-reviews/{session_id}")
+async def list_document_reviews(session_id: int) -> Dict[str, Any]:
+    get_session(session_id)
+    return {"reviews": get_session_document_reviews(session_id)}
 
 
 @app.get("/")

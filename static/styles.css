@@ -130,8 +130,54 @@ button:hover {
 }
 
 .hidden {
-  display: none;
+  display: none !important;
 }
+
+.app-nav {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 18px;
+  background: #ffffff;
+  padding: 8px;
+  border-radius: 18px;
+  box-shadow: 0 8px 24px rgba(19, 26, 41, 0.05);
+  border: 1px solid #e1e8f2;
+  overflow-x: auto;
+}
+
+.nav-tab {
+  background: transparent;
+  color: #425168;
+  border: 0;
+  border-radius: 12px;
+  padding: 10px 18px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.2s ease;
+}
+
+.nav-tab:hover {
+  background: #f0f4ff;
+  color: #14213d;
+}
+
+.nav-tab.active {
+  background: #2e64ff;
+  color: #ffffff;
+  box-shadow: 0 4px 12px rgba(46, 100, 255, 0.25);
+}
+
+.app-page {
+  animation: fadeIn 0.25s ease-in-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 
 .workspace-grid {
   display: grid;
@@ -477,6 +523,135 @@ button:hover {
 .note {
   font-size: 0.95rem;
   color: #425168;
+}
+
+.profile-card {
+  display: grid;
+  gap: 8px;
+}
+
+.profile-card .profile-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.9rem;
+}
+
+.profile-card .profile-label {
+  font-weight: 600;
+  color: #425168;
+}
+
+.profile-card .profile-value {
+  color: #22304a;
+  text-align: right;
+}
+
+.secondary-button {
+  background: #eef2fb;
+  color: #22304a;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 20, 34, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 50;
+}
+
+.modal-card {
+  width: 100%;
+  max-width: 420px;
+  margin: 0;
+}
+
+.northstar-updated {
+  margin: 4px 0 0;
+  font-size: 0.85rem;
+  color: #b9c8ff;
+}
+
+.northstar-whats-new {
+  border: 1px solid rgba(255, 209, 102, 0.5);
+  background: rgba(255, 209, 102, 0.12);
+  border-radius: 14px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+}
+
+.northstar-whats-new p {
+  margin: 0 0 4px;
+  font-weight: 700;
+  color: #ffd166;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.northstar-whats-new ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #fff;
+  font-size: 0.9rem;
+}
+
+.appointments-menu {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px;
+}
+
+.appointment-option {
+  display: grid;
+  gap: 6px;
+  text-align: left;
+  border: 1px solid #d8e2ef;
+  background: #f7f9ff;
+  border-radius: 16px;
+  padding: 16px;
+  cursor: pointer;
+}
+
+.appointment-option:hover {
+  background: #edf2ff;
+}
+
+.appointment-option.disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  background: #f4f6fa;
+}
+
+.appointment-option-title {
+  font-weight: 700;
+  font-size: 1rem;
+}
+
+.appointment-option-desc {
+  font-size: 0.85rem;
+  color: #5a6b82;
+}
+
+.appointments-back {
+  margin-bottom: 16px;
+}
+
+.resume-step {
+  display: grid;
+  gap: 14px;
+  margin-top: 8px;
+}
+
+.resume-step h3 {
+  margin: 0;
+}
+
+.resume-upload-error {
+  color: #b3403a;
 }
 
 @media (max-width: 900px) {
