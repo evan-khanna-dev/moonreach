@@ -862,6 +862,14 @@ northstarGoalSaveButton.addEventListener("click", () => {
 
 const buildActionChip = (text) =>
   buildChip(text, () => {
+    // This chip lives inside the already-open star panel, which pushed its
+    // own focus() frame - it must be released before jumping into the belt
+    // panels, or that frame is orphaned on the stack forever (never popped
+    // by closing chat/chats, since neither of those closes knows the star
+    // panel is what's underneath). An orphaned frame leaves isLocked() true
+    // and the camera parked on the star preset even after every panel is
+    // closed, silently disabling orbit/drag/scroll.
+    closeStarPanel();
     openChatsPanel();
     // Land straight in the most recent chat with the suggestion queued.
     if (sessions.length) {
