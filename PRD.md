@@ -54,12 +54,14 @@ College students (the competition's actual entrant/judge audience), who want qui
 - **Backend:** Python, FastAPI
 - **AI:** Claude API (Anthropic Python SDK)
 - **Database:** Supabase (Postgres)
-- **Frontend:** Simple web UI (plain HTML/CSS/JS or a lightweight framework), functional over polished
+- **Frontend:** Plain HTML/CSS/JS, no framework. Implemented as a Three.js 3D scene (moon, ridge, asteroid belt, north star, starfield) that serves as the entire navigation surface — every feature opens as a 2D overlay panel triggered by clicking an object in the scene, rather than a traditional page/dashboard layout.
 - **Search:** a web search API/tool, triggered conditionally as described in Feature 4
 
-### Database Schema (already created — connect to existing tables, do not recreate)
+### Database Schema
 
-**`sessions` table:**
+The schema below is what shipped for the MVP demo (`sessions`, `messages`) — see [Current Implementation Status](#current-implementation-status) for how it grew from there. Original tables, connected to as-is, not recreated:
+
+**`sessions` table (original shape):**
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `int8` | primary key, identity/auto-increment |
@@ -87,6 +89,7 @@ ANTHROPIC_API_KEY=...
 SUPABASE_URL=...
 SUPABASE_KEY=...
 ```
+As the app grew, two optional variables were added: `SUPABASE_SERVICE_ROLE_KEY` (used instead of `SUPABASE_KEY` when RLS requires it) and `ANTHROPIC_MODEL` (defaults to `claude-sonnet-5` if unset). See `README.md` for the current full list.
 
 ### API Endpoints (suggested shape — implementer may adjust naming/structure as needed)
 1. `POST /session` — accepts university, major, year, goals; inserts into `sessions`; returns `session_id`
@@ -110,4 +113,16 @@ SUPABASE_KEY=...
 - Do not add resume generation, role-matching, or gamification features
 - Do not add academic advising features (course/degree planning) — career-focused only
 - Do not hardcode support for specific universities — the search feature must work generically for any university name provided
-- Do not modify the existing Supabase schema — connect to the tables as defined above
+- Do not silently alter the original `sessions`/`messages` tables — new tables/columns for later features (see below) must go through an explicit, reviewed migration + rollback pair, same as the ones already in this repo
+
+## Current Implementation Status
+
+The MVP above shipped, then grew past it. This section tracks the delta so the PRD stays a useful reference instead of a historical artifact.
+
+- **Frontend rebuilt as a 3D scene.** No page/dashboard layout — the moon, ridge, asteroid belt, and north star are the entire navigation surface; clicking one opens its feature as a 2D overlay panel. See `README.md` for the object → feature mapping.
+- **Identity split out of `sessions` into a `profiles` table**, captured once per browser via an anonymous device id (`X-Device-Id` header) instead of once per chat. `sessions` now holds `profile_id` + `goals` per chat; university/major/year live on `profiles`. Migration: `supabase_migration_profiles.sql`.
+- **Career Radar added** — a persistent `opportunities` table per chat (title, category, description, priority, status, source), which Claude can add/update/reprioritize/archive through structured `career_radar_updates` in its response. Migration: `supabase_migration.sql`.
+- **Action Plan persisted** — a `plans` table per chat, generated on demand from that chat's history (still matches the original Plan Generator feature, just now saved rather than ephemeral).
+- **North Star added** — cross-chat synthesis (current direction, priorities, risks, upcoming opportunities) over the whole profile and every chat under it, snapshotted to `north_star_snapshots` so the UI can show "what's new" since the last run. Not in the original MVP scope; added afterward as the profile-level complement to per-chat plans.
+- **Resume feedback added, then its frontend removed.** A `document_reviews` table and `/resume-upload` + `/document-reviews` endpoints (PDF/DOCX/TXT extraction via Docling, structured feedback, follow-up thread) were built and are still live on the backend, but the overlay panel for them was removed from the 3D-scene frontend — they're only reachable by calling the API directly today. This is resume *feedback on existing content*, not resume *generation*, so it doesn't conflict with the Non-Goals above. Migration: `supabase_migration_document_reviews.sql`.
+- **`supabase_migration_scene_ui.sql` exists but is optional/unused.** It adds `opportunities.notes` and extra `profiles` columns (`name`, `interests`, `bio`, `north_star_goal`) from an earlier pass at the 3D UI. The current frontend keeps those fields in browser `localStorage` instead, so this migration isn't required for the app to run.
